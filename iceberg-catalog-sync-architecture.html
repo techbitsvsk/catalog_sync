@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Iceberg Catalog Sync — Architecture</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: #0b0e14; color: #c9d1d9; padding: 2rem; }
+  h1 { text-align: center; font-size: 1.6rem; color: #7ee787; margin-bottom: 0.3rem; }
+  .subtitle { text-align: center; font-size: 1rem; color: #8b949e; margin-bottom: 2.5rem; }
+  .grid { display: flex; flex-direction: column; gap: 2.5rem; max-width: 1200px; margin: 0 auto; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 1.5rem; }
+  .card h2 { color: #58a6ff; font-size: 1.05rem; margin-bottom: 1rem; border-bottom: 1px solid #21262d; padding-bottom: 0.5rem; }
+  .card h2 span { color: #8b949e; font-weight: 400; font-size: 0.85rem; margin-left: 0.5rem; }
+  .mermaid { display: flex; justify-content: center; overflow-x: auto; }
+  .mermaid svg { max-width: 100%; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
+  @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<h1>Iceberg Catalog Sync — Architecture</h1>
+<p class="subtitle">Platform-agnostic Iceberg table replication with full metadata rewriting</p>
+
+<div class="grid">
+
+<!-- 1. THE PROBLEM -->
+<div class="card">
+<h2>1. The Problem <span>— Why naive file copy fails</span></h2>
+<div class="mermaid">
+flowchart LR
+    subgraph AWS["AWS S3"]
+        M1["metadata.json\n<b>location:</b> s3://warehouse/..."]
+        ML1["manifest-list.avro\n<b>manifest_path:</b> s3://..."]
+        MF1["manifest.avro\n<b>file_path:</b> s3://...data/00001.parquet"]
+        D1["00001.parquet"]
+        M1 --> ML1 --> MF1 --> D1
+    end
+
+    subgraph Azure["Azure ADLS (after naive copy)"]
+        M2["metadata.json\n<b>location:</b> s3://warehouse/... ❌"]
+        ML2["manifest-list.avro\n<b>manifest_path:</b> s3://... ❌"]
+        MF2["manifest.avro\n<b>file_path:</b> s3://... ❌"]
+        D2["00001.parquet ✅"]
+        M2 --> ML2 --> MF2 -.->|"points back\nto AWS!"| D1
+    end
+
+    AWS -- "azcopy / file sync" --> Azure
+
+    style AWS fill:#1a1e2e,stroke:#f0883e,color:#c9d1d9
+    style Azure fill:#1a1e2e,stroke:#da3633,color:#c9d1d9
+    style D1 fill:#238636,stroke:#2ea043,color:#fff
+    style D2 fill:#238636,stroke:#2ea043,color:#fff
+    style M2 fill:#6e1b1b,stroke:#da3633,color:#ffa198
+    style ML2 fill:#6e1b1b,stroke:#da3633,color:#ffa198
+    style MF2 fill:#6e1b1b,stroke:#da3633,color:#ffa198
+</div>
+</div>
+
+<!-- 2. THE SOLUTION -->
+<div class="card">
+<h2>2. The Solution <span>— Sync with metadata rewrite</span></h2>
+<div class="mermaid">
+flowchart TB
+    subgraph CatalogSync["CatalogSync Orchestrator"]
+        direction TB
+        S1["① Discover\nfind_latest_metadata()"]
+        S2["② Diff\nCompare data files\n(incremental — new only)"]
+        S3["③ Copy\nTransfer new Parquet files\n(parallel, cross-cloud)"]
+        S4["④ Rewrite\nMetadataRewriter\ntranslate every URI"]
+        S5["⑤ Commit\nWrite version-hint.text\n(atomic pointer)"]
+        S1 --> S2 --> S3 --> S4 --> S5
+    end
+
+    subgraph Source["Source (AWS S3)"]
+        SM["metadata.json\ns3://..."]
+        SD["data/*.parquet"]
+    end
+
+    subgraph Target["Target (Azure ADLS)"]
+        TM["metadata.json\nabfss://... ✅"]
+        TD["data/*.parquet ✅"]
+    end
+
+    Source --> S1
+    S3 --> TD
+    S4 --> TM
+    S5 -->|"table becomes\nreadable"| Target
+
+    style CatalogSync fill:#0d1117,stroke:#58a6ff,color:#c9d1d9
+    style Source fill:#1a1e2e,stroke:#f0883e,color:#c9d1d9
+    style Target fill:#1a1e2e,stroke:#7ee787,color:#c9d1d9
+    style S1 fill:#1f2937,stroke:#58a6ff,color:#c9d1d9
+    style S2 fill:#1f2937,stroke:#58a6ff,color:#c9d1d9
+    style S3 fill:#1f2937,stroke:#58a6ff,color:#c9d1d9
+    style S4 fill:#1f2937,stroke:#d2a8ff,color:#c9d1d9
+    style S5 fill:#1f2937,stroke:#7ee787,color:#c9d1d9
+</div>
+</div>
+
+<!-- 3. METADATA REWRITE CHAIN -->
+<div class="card">
+<h2>3. Metadata Rewrite Chain <span>— Every layer is translated</span></h2>
+<div class="mermaid">
+flowchart TB
+    subgraph Source["Source Metadata (s3://)"]
+        direction TB
+        SM["<b>v3.metadata.json</b>\nlocation: s3://warehouse/iceberg/gold/top_customers\nsnapshots[0].manifest-list: s3://.../snap-1000.avro"]
+        SML["<b>snap-1000.avro</b> (manifest-list)\nmanifest_path: s3://.../m-001.avro"]
+        SMF["<b>m-001.avro</b> (manifest)\ndata_file.file_path: s3://.../data/00001.parquet\ndata_file.file_path: s3://.../data/00002.parquet"]
+        SM --> SML --> SMF
+    end
+
+    PT["<b>PathTranslator</b>\ns3://warehouse/iceberg/\n        ↓\nabfss://iceberg@acct...net/iceberg/"]
+
+    subgraph Target["Target Metadata (abfss://)"]
+        direction TB
+        TM["<b>v3.metadata.json</b>\nlocation: abfss://iceberg@acct...net/iceberg/gold/top_customers\nsnapshots[0].manifest-list: abfss://.../snap-1000.avro"]
+        TML["<b>snap-1000.avro</b> (manifest-list)\nmanifest_path: abfss://.../m-001.avro"]
+        TMF["<b>m-001.avro</b> (manifest)\ndata_file.file_path: abfss://.../data/00001.parquet\ndata_file.file_path: abfss://.../data/00002.parquet"]
+        TM --> TML --> TMF
+    end
+
+    VH["<b>version-hint.text</b>\n'3'\n(written LAST)"]
+
+    Source --> PT --> Target
+    Target --> VH
+
+    style Source fill:#1a1e2e,stroke:#f0883e,color:#c9d1d9
+    style Target fill:#1a1e2e,stroke:#7ee787,color:#c9d1d9
+    style PT fill:#1f0d3a,stroke:#d2a8ff,color:#e2c5ff
+    style VH fill:#0b3d0b,stroke:#7ee787,color:#7ee787
+</div>
+</div>
+
+<!-- 4. MODULE ARCHITECTURE -->
+<div class="card">
+<h2>4. Module Architecture <span>— Code structure</span></h2>
+<div class="mermaid">
+flowchart TB
+    CLI["<b>cli.py</b>\niceberg-sync table / namespace\n--dry-run, --parallel"]
+    AF["<b>airflow/operators.py</b>\nIcebergTableSyncOperator\nIcebergNamespaceSyncOperator\nIcebergHealthCheckOperator"]
+    API["<b>Python API</b>\nfrom iceberg_sync.sync import CatalogSync"]
+
+    CS["<b>sync/catalog_sync.py</b>\nCatalogSync\nOrchestrates: diff → copy → rewrite → commit"]
+
+    PT["<b>path_translator.py</b>\nPathTranslator\nURI mapping: any → any\nReversible for failback"]
+
+    MR["<b>metadata/rewriter.py</b>\nMetadataRewriter\nJSON + Avro rewrite chain\nfind_latest_metadata()"]
+
+    subgraph Storage["<b>storage/</b> — Pluggable backends"]
+        SB["base.py\nStorageBackend\n(abstract)"]
+        S3["s3.py\nS3 + MinIO"]
+        ADLS["adls.py\nADLS Gen2"]
+        GCS["gcs.py\nGoogle Cloud"]
+        MEM["memory.py\nIn-memory\n(tests)"]
+        SB --- S3
+        SB --- ADLS
+        SB --- GCS
+        SB --- MEM
+    end
+
+    CLI --> CS
+    AF --> CS
+    API --> CS
+    CS --> PT
+    CS --> MR
+    CS --> Storage
+    MR --> PT
+    MR --> Storage
+
+    style CLI fill:#1f2937,stroke:#58a6ff,color:#c9d1d9
+    style AF fill:#1f2937,stroke:#f0883e,color:#c9d1d9
+    style API fill:#1f2937,stroke:#7ee787,color:#c9d1d9
+    style CS fill:#0d1117,stroke:#d2a8ff,color:#e2c5ff
+    style PT fill:#1f0d3a,stroke:#d2a8ff,color:#e2c5ff
+    style MR fill:#1f0d3a,stroke:#d2a8ff,color:#e2c5ff
+    style Storage fill:#161b22,stroke:#30363d,color:#c9d1d9
+    style SB fill:#21262d,stroke:#484f58,color:#c9d1d9
+    style S3 fill:#1a1e2e,stroke:#f0883e,color:#c9d1d9
+    style ADLS fill:#1a1e2e,stroke:#58a6ff,color:#c9d1d9
+    style GCS fill:#1a1e2e,stroke:#7ee787,color:#c9d1d9
+    style MEM fill:#1a1e2e,stroke:#8b949e,color:#c9d1d9
+</div>
+</div>
+
+<!-- 5. MULTI-CLOUD FAILOVER (with Airflow) -->
+<div class="card">
+<h2>5. Multi-Cloud Failover Pattern <span>— Airflow-orchestrated active-passive</span></h2>
+<div class="mermaid">
+flowchart TB
+    subgraph Airflow["Airflow (neutral zone)"]
+        direction TB
+        PP["<b>Primary Pipeline DAG</b>\nIngest → Bronze → Silver → Gold\n(targets AWS)"]
+        T1["<b>Tier 1 Sync DAG</b>\nGold tables → Azure\n(after every pipeline run)"]
+        T2["<b>Tier 2 Sync DAG</b>\nSilver tables → Azure\n(nightly 2 AM)"]
+        HC["<b>Failover Monitor DAG</b>\nPing AWS every 5 min\nSets FAILOVER_ACTIVE variable"]
+        FP["<b>Failover Pipeline DAG</b>\nSame pipeline code\n(targets Azure Fabric)"]
+
+        PP --> T1
+        PP -.-> T2
+        HC -->|"AWS down"| FP
+    end
+
+    subgraph AWS["AWS (Primary)"]
+        S3W["S3\nIceberg Warehouse"]
+        Glue["Glue ETL"]
+        Athena["Athena"]
+        Glue --> S3W
+        S3W --> Athena
+    end
+
+    subgraph Azure["Azure (Standby)"]
+        ADLS["ADLS Gen2\nIceberg Warehouse\n(replicated)"]
+        Fabric["Fabric Spark"]
+        FabSQL["Fabric SQL\nEndpoint"]
+        Fabric --> ADLS
+        ADLS --> FabSQL
+    end
+
+    PP --> Glue
+    T1 -->|"CatalogSync\n+ metadata rewrite"| ADLS
+    T2 -->|"CatalogSync\n+ metadata rewrite"| ADLS
+    FP -->|"failover"| Fabric
+
+    style Airflow fill:#0d1117,stroke:#f0883e,color:#c9d1d9
+    style AWS fill:#1a1e2e,stroke:#f0883e,color:#c9d1d9
+    style Azure fill:#1a1e2e,stroke:#58a6ff,color:#c9d1d9
+    style PP fill:#1f2937,stroke:#7ee787,color:#c9d1d9
+    style T1 fill:#1f2937,stroke:#d2a8ff,color:#c9d1d9
+    style T2 fill:#1f2937,stroke:#8b949e,color:#c9d1d9
+    style HC fill:#1f2937,stroke:#f85149,color:#c9d1d9
+    style FP fill:#1f2937,stroke:#f85149,color:#ffa198
+</div>
+</div>
+
+<!-- 6. CONSISTENCY TIMELINE -->
+<div class="card">
+<h2>6. Sync Consistency Guarantee <span>— Atomic commit via version-hint.text</span></h2>
+<div class="mermaid">
+sequenceDiagram
+    participant S as Source (AWS S3)
+    participant CS as CatalogSync
+    participant T as Target (Azure ADLS)
+
+    Note over S,T: Target may have previous version (v2) or nothing
+
+    CS->>S: find_latest_metadata()
+    S-->>CS: v3.metadata.json
+
+    CS->>S: list data files
+    CS->>T: list data files (diff)
+    Note over CS: Only new files need copying
+
+    CS->>S: read new data files
+    CS->>T: write new data files
+    Note over T: Data files in place, but v2 metadata<br/>still active — target reads OLD state
+
+    CS->>S: read manifest (Avro)
+    CS->>CS: rewrite file_path URIs
+    CS->>T: write rewritten manifest
+
+    CS->>S: read manifest-list (Avro)
+    CS->>CS: rewrite manifest_path URIs
+    CS->>T: write rewritten manifest-list
+
+    CS->>S: read metadata.json
+    CS->>CS: rewrite location + snapshot paths
+    CS->>T: write rewritten metadata.json
+
+    CS->>T: write version-hint.text = "3"
+    Note over T: ATOMIC SWITCH — target now reads v3<br/>All data + metadata in place ✅
+
+    rect rgb(11, 61, 11)
+    Note over T: Target table is now readable<br/>with all abfss:// paths
+    end
+</div>
+</div>
+
+<!-- 7. REVERSE SYNC (FAILBACK) -->
+<div class="card">
+<h2>7. Failback <span>— Reverse sync after AWS recovers</span></h2>
+<div class="mermaid">
+flowchart LR
+    subgraph Normal["Normal Operation"]
+        direction LR
+        A1["AWS S3\n(primary)"]
+        B1["Azure ADLS\n(standby)"]
+        A1 -->|"CatalogSync\ns3:// → abfss://"| B1
+    end
+
+    subgraph Failover["During AWS Outage"]
+        direction LR
+        A2["AWS S3\n(down ❌)"]
+        B2["Azure ADLS\n(active)"]
+        F2["Fabric Spark\n(running pipeline)"]
+        F2 --> B2
+    end
+
+    subgraph Failback["After AWS Recovers"]
+        direction LR
+        B3["Azure ADLS\n(has new data)"]
+        A3["AWS S3\n(recovered)"]
+        B3 -->|"CatalogSync.reverse()\nabfss:// → s3://"| A3
+    end
+
+    Normal --> Failover --> Failback
+
+    style Normal fill:#0d1117,stroke:#7ee787,color:#c9d1d9
+    style Failover fill:#0d1117,stroke:#f85149,color:#c9d1d9
+    style Failback fill:#0d1117,stroke:#58a6ff,color:#c9d1d9
+    style A2 fill:#6e1b1b,stroke:#da3633,color:#ffa198
+</div>
+</div>
+
+<!-- 8. DATA TIERING -->
+<div class="card">
+<h2>8. Replication Tiers <span>— Not everything needs real-time sync</span></h2>
+<div class="mermaid">
+flowchart LR
+    subgraph Tier1["Tier 1 — Hot (Gold)"]
+        G1["revenue_by_order_date"]
+        G2["top_customers"]
+    end
+
+    subgraph Tier2["Tier 2 — Warm (Silver)"]
+        S1["silver.orders"]
+        S2["silver.lineitem"]
+    end
+
+    subgraph Tier3["Tier 3 — Cold (Bronze + Raw)"]
+        B1["bronze.orders"]
+        B2["bronze.lineitem"]
+        R1["raw CSVs"]
+    end
+
+    Tier1 -->|"Sync after every\npipeline run\nRPO: ~minutes"| AZ1["Azure Gold ✅"]
+    Tier2 -->|"Nightly sync\nRPO: ~24 hours"| AZ2["Azure Silver"]
+    Tier3 -->|"Weekly / on-demand\nRPO: ~7 days"| AZ3["Azure Bronze"]
+
+    style Tier1 fill:#0b3d0b,stroke:#7ee787,color:#7ee787
+    style Tier2 fill:#1a1e2e,stroke:#58a6ff,color:#c9d1d9
+    style Tier3 fill:#1a1e2e,stroke:#8b949e,color:#8b949e
+    style AZ1 fill:#0b3d0b,stroke:#7ee787,color:#7ee787
+    style AZ2 fill:#1a1e2e,stroke:#58a6ff,color:#c9d1d9
+    style AZ3 fill:#1a1e2e,stroke:#8b949e,color:#8b949e
+</div>
+</div>
+
+</div>
+
+<script>
+mermaid.initialize({
+    theme: 'dark',
+    themeVariables: {
+        primaryColor: '#58a6ff',
+        primaryTextColor: '#c9d1d9',
+        primaryBorderColor: '#30363d',
+        lineColor: '#484f58',
+        secondaryColor: '#1f2937',
+        tertiaryColor: '#161b22',
+        noteBkgColor: '#161b22',
+        noteTextColor: '#c9d1d9',
+        noteBorderColor: '#30363d',
+        actorBkg: '#1f2937',
+        actorTextColor: '#c9d1d9',
+        actorBorder: '#58a6ff',
+        signalColor: '#58a6ff',
+        signalTextColor: '#c9d1d9',
+    },
+    flowchart: { curve: 'basis', padding: 20 },
+    sequence: { mirrorActors: false, messageMargin: 40 },
+});
+</script>
+</body>
+</html>

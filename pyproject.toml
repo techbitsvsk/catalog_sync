@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iceberg-catalog-sync"
+version = "0.1.0"
+description = "Platform-agnostic Iceberg catalog sync for multi-cloud data resilience"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+
+dependencies = [
+    "boto3>=1.28",
+    "azure-storage-blob>=12.19",
+    "azure-identity>=1.15",
+    "google-cloud-storage>=2.14",
+    "fastavro>=1.9",
+    "orjson>=3.9",
+    "click>=8.1",
+    "rich>=13.0",
+    "tenacity>=8.2",
+]
+
+[project.optional-dependencies]
+airflow = ["apache-airflow>=2.7"]
+dev = ["pytest>=7.0", "pytest-cov", "moto[s3]>=5.0", "ruff>=0.4"]
+
+[project.scripts]
+iceberg-sync = "iceberg_sync.cli:main"
+
+[project.entry-points."airflow.plugins"]
+iceberg_sync = "iceberg_sync.airflow.operators"
+
+[tool.setuptools.packages.find]
+where = ["src"]
