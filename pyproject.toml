@@ -24,7 +24,8 @@ dependencies = [
 
 [project.optional-dependencies]
 airflow = ["apache-airflow>=2.7"]
-dev = ["pytest>=7.0", "pytest-cov", "moto[s3]>=5.0", "ruff>=0.4"]
+nessie = ["requests>=2.31"]
+dev = ["pytest>=7.0", "pytest-cov", "moto[s3]>=5.0", "ruff>=0.4", "requests>=2.31"]
 
 [project.scripts]
 iceberg-sync = "iceberg_sync.cli:main"

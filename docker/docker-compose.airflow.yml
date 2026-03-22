@@ -1,0 +1,107 @@
+# docker/docker-compose.airflow.yml
+#
+# Airflow (LocalExecutor) for running iceberg-catalog-sync DAGs.
+# Extends docker-compose.yml — start both together:
+#
+#   docker compose \
+#       -f docker/docker-compose.yml \
+#       -f docker/docker-compose.airflow.yml \
+#       up -d
+#
+# First-time setup:
+#   docker compose -f docker/docker-compose.yml \
+#                  -f docker/docker-compose.airflow.yml \
+#                  run --rm airflow-init
+#
+# Airflow UI: http://localhost:8080  (admin / admin)
+#
+# Set Airflow Variables after startup:
+#   docker exec -it airflow-webserver \
+#     airflow variables set ICEBERG_ADLS_SOURCE_ROOT \
+#       "abfss://iceberg@mystorageacct.dfs.core.windows.net/"
+#   docker exec -it airflow-webserver \
+#     airflow variables set ICEBERG_NESSIE_URI "http://nessie:19120"
+#   (see full list in airflow_dags/iceberg_sync_dag.py docstring)
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.3-python3.11
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    # Install iceberg-catalog-sync at startup
+    _PIP_ADDITIONAL_REQUIREMENTS: "iceberg-catalog-sync[nessie,airflow] @ /opt/iceberg_sync"
+  volumes:
+    - ../airflow_dags:/opt/airflow/dags          # DAG files
+    - airflow-logs:/opt/airflow/logs
+    - ..:/opt/iceberg_sync                        # install local package
+  depends_on:
+    airflow-db:
+      condition: service_healthy
+  networks:
+    - iceberg-net
+
+services:
+
+  # ── PostgreSQL for Airflow metadata ─────────────────────────────────────────
+  airflow-db:
+    image: postgres:15-alpine
+    container_name: airflow-db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - iceberg-net
+
+  # ── Airflow init (run once) ──────────────────────────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create \
+          --username admin --password admin \
+          --firstname Admin --lastname User \
+          --role Admin --email admin@example.com &&
+        echo "✓ Airflow initialised"
+    restart: "no"
+
+  # ── Airflow webserver ────────────────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Airflow scheduler ────────────────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    restart: unless-stopped
+
+volumes:
+  airflow-logs:
+  airflow-db-data:

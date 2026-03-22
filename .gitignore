@@ -8,20 +8,71 @@ build/
 *.egg
 .venv/
 venv/
+env/
+*.pyo
 
 # IDE
 .idea/
 .vscode/
 *.swp
+*.swo
+*~
 
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
 
 # Test / coverage
 .pytest_cache/
 htmlcov/
 .coverage
+.coverage.*
+coverage.xml
 
-# Env
+# Env / secrets
 .env
+.env.*
+*.env
+secrets.json
+credentials.json
+
+# Temp / scratch files
+*.tmp
+*.temp
+*.bak
+*.orig
+*.log
+tmp/
+temp/
+scratch/
+Untitled-*.py
+Untitled-*.ipynb
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# PyIceberg / Hive metastore (created during dev/testing)
+pyiceberg_catalog.db
+metastore/
+metastore_db/
+derby.log
+metastore-site.xml
+hive-site.xml
+warehouse/
+spark-warehouse/
+local-warehouse/
+
+# Downloaded / generated Iceberg metadata (created by verify steps in README)
+*.metadata.json
+*.avro
+version-hint.text
+
+# mypy / type checkers
+.mypy_cache/
+.ruff_cache/
+
+# Packaging
+MANIFEST

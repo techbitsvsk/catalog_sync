@@ -8,49 +8,284 @@
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: #0b0e14; color: #c9d1d9; padding: 2rem; }
   h1 { text-align: center; font-size: 1.6rem; color: #7ee787; margin-bottom: 0.3rem; }
-  .subtitle { text-align: center; font-size: 1rem; color: #8b949e; margin-bottom: 2.5rem; }
-  .grid { display: flex; flex-direction: column; gap: 2.5rem; max-width: 1200px; margin: 0 auto; }
+  .subtitle { text-align: center; font-size: 1rem; color: #8b949e; margin-bottom: 0.5rem; }
+  .updated { text-align: center; font-size: 0.8rem; color: #484f58; margin-bottom: 2.5rem; }
+  .grid { display: flex; flex-direction: column; gap: 2.5rem; max-width: 1280px; margin: 0 auto; }
   .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 1.5rem; }
   .card h2 { color: #58a6ff; font-size: 1.05rem; margin-bottom: 1rem; border-bottom: 1px solid #21262d; padding-bottom: 0.5rem; }
   .card h2 span { color: #8b949e; font-weight: 400; font-size: 0.85rem; margin-left: 0.5rem; }
   .mermaid { display: flex; justify-content: center; overflow-x: auto; }
   .mermaid svg { max-width: 100%; }
   .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
+  .section-header {
+    text-align: center;
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #484f58;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+  }
+  .section-header::before,
+  .section-header::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: #21262d;
+  }
   @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
 
 <h1>Iceberg Catalog Sync — Architecture</h1>
-<p class="subtitle">Platform-agnostic Iceberg table replication with full metadata rewriting</p>
+<p class="subtitle">Platform-agnostic Iceberg replication · ADLS / S3 / GCS → on-prem Nessie · Airflow-orchestrated</p>
+<p class="updated">Updated March 2026 — modern Iceberg metadata discovery · version-hint.text optional for REST catalogs · Airflow DAG factory</p>
 
 <div class="grid">
 
-<!-- 1. THE PROBLEM -->
+<!-- ═══════════════════ SECTION 0: COMPLETE FLOW OVERVIEW ═══════════════════ -->
+<div class="section-header">Complete Flow Overview</div>
+
+<!-- 0A. END-TO-END SYSTEM OVERVIEW -->
 <div class="card">
-<h2>1. The Problem <span>— Why naive file copy fails</span></h2>
+<h2>End-to-End System Overview <span>— All systems, data paths, and control flows in one view</span></h2>
 <div class="mermaid">
 flowchart LR
-    subgraph AWS["AWS S3"]
-        M1["metadata.json\n<b>location:</b> s3://warehouse/..."]
-        ML1["manifest-list.avro\n<b>manifest_path:</b> s3://..."]
-        MF1["manifest.avro\n<b>file_path:</b> s3://...data/00001.parquet"]
+    subgraph azure["Azure Cloud"]
+        subgraph fabric["Fabric Lakehouse / Synapse Analytics"]
+            pipeline["ADF / Spark Pipeline\nwrites Iceberg partitions"]
+            adls_node["ADLS Gen2\nabfss://iceberg@acct.dfs.core.windows.net/\ngold/top_customers/\n  metadata/v3.metadata.json   abfss://\n  metadata/snap-1000.avro     abfss://\n  metadata/m-001.avro         abfss://\n  data/00001…00180.parquet"]
+            pipeline -->|"append-only\npartition writes"| adls_node
+        end
+    end
+
+    subgraph af_box["Airflow :8080"]
+        direction TB
+        af_sched["Scheduler\nevery 15 min"]
+        af_dag["iceberg_sync_adls_to_nessie\nmake_iceberg_sync_dag(SyncPipelineConfig)\nsource: abfss://   target: s3a://\nnessie_uri: http://nessie:19120"]
+        af_sched -->|"triggers"| af_dag
+    end
+
+    subgraph eng["iceberg-catalog-sync"]
+        direction TB
+        e1["① Discover\nfind_latest_metadata()\n① Hadoop: version-hint.text fast path\n② Modern: 00NNN-UUID.metadata.json\n③ Fallback: read last-updated-ms"]
+        e2["② Diff\nread_snapshot_data_files()\nmanifest-based — any data layout\nincludes v2 delete files"]
+        e3["③ Copy Parquet\nparallel threads\nADLS → MinIO"]
+        e4["④ Rewrite Metadata\nPathTranslator  abfss→s3a\nfastavro Avro rewrite"]
+        e5["⑤ Atomic Commit\nversion-hint.text  (Hadoop catalog only)\nSkipped for REST catalog targets\n(Nessie is the authoritative pointer)"]
+        e6["⑥ Health Check\nno leaked abfss:// URIs"]
+        e7["⑦ Register Catalog\nNessieCatalog.register_or_update()\nPOST /iceberg/v1/namespaces/gold/register"]
+        e1 --> e2 --> e3 --> e4 --> e5 --> e6 --> e7
+    end
+
+    subgraph onprem["On-Premises"]
+        subgraph minio_sub["MinIO :9000"]
+            minio_node["s3a://warehouse/gold/top_customers/\n  metadata/v3.metadata.json   s3a:// ✅\n  metadata/snap-1000.avro     s3a:// ✅\n  metadata/m-001.avro         s3a:// ✅\n  data/00001…00180.parquet         ✅"]
+        end
+        subgraph nessie_sub["Nessie REST Catalog :19120"]
+            nessie_node["gold.top_customers\nmetadata-location:\ns3a://warehouse/gold/top_customers/\n  metadata/v3.metadata.json"]
+        end
+        subgraph clients["Query Engines"]
+            direction TB
+            cl1["Apache Spark\n+ Iceberg + Nessie jars"]
+            cl2["Trino\n+ iceberg connector"]
+            cl3["PyIceberg\nRestCatalog('nessie')"]
+            cl4["DuckDB\n+ iceberg extension"]
+        end
+        minio_node -->|"s3a:// Parquet reads\ncolumnar scan"| clients
+        nessie_node -->|"Iceberg REST\nload_table()"| clients
+    end
+
+    adls_node -->|"source reads\nADLS SDK"| eng
+    af_dag -->|"orchestrates"| eng
+    e3 -->|"Parquet files\n(new only)"| minio_node
+    e4 -->|"rewritten metadata\n(s3a:// paths)"| minio_node
+    e5 -->|"version-hint.text"| minio_node
+    e7 -->|"catalog entry"| nessie_node
+
+    style azure fill:#0d1117,stroke:#58a6ff,color:#c9d1d9
+    style fabric fill:#161b22,stroke:#58a6ff,color:#c9d1d9
+    style pipeline fill:#21262d,stroke:#58a6ff,color:#c9d1d9
+    style adls_node fill:#1a2035,stroke:#58a6ff,color:#c9d1d9
+    style af_box fill:#1a1e2e,stroke:#f0883e,color:#c9d1d9
+    style af_sched fill:#21262d,stroke:#f0883e,color:#c9d1d9
+    style af_dag fill:#21262d,stroke:#f0883e,color:#c9d1d9
+    style eng fill:#0d1117,stroke:#d2a8ff,color:#e2c5ff
+    style e1 fill:#1f2937,stroke:#58a6ff,color:#c9d1d9
+    style e2 fill:#1f2937,stroke:#58a6ff,color:#c9d1d9
+    style e3 fill:#1f2937,stroke:#58a6ff,color:#c9d1d9
+    style e4 fill:#1f0d3a,stroke:#d2a8ff,color:#e2c5ff
+    style e5 fill:#0b3d0b,stroke:#7ee787,color:#7ee787
+    style e6 fill:#1f2937,stroke:#d2a8ff,color:#c9d1d9
+    style e7 fill:#0b3d0b,stroke:#7ee787,color:#7ee787
+    style onprem fill:#0d1117,stroke:#7ee787,color:#c9d1d9
+    style minio_sub fill:#161b22,stroke:#f0883e,color:#c9d1d9
+    style minio_node fill:#1a2035,stroke:#f0883e,color:#c9d1d9
+    style nessie_sub fill:#0b3d0b,stroke:#7ee787,color:#c9d1d9
+    style nessie_node fill:#0d2a0d,stroke:#7ee787,color:#7ee787
+    style clients fill:#1a1e2e,stroke:#d2a8ff,color:#c9d1d9
+    style cl1 fill:#21262d,stroke:#d2a8ff,color:#c9d1d9
+    style cl2 fill:#21262d,stroke:#d2a8ff,color:#c9d1d9
+    style cl3 fill:#21262d,stroke:#d2a8ff,color:#c9d1d9
+    style cl4 fill:#21262d,stroke:#d2a8ff,color:#c9d1d9
+</div>
+</div>
+
+<!-- 0B. COMPLETE SYNC SEQUENCE -->
+<div class="card">
+<h2>Complete Sync Sequence <span>— Every step from Airflow trigger to queryable table</span></h2>
+<div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant AF as Airflow DAG
+    participant SRC as ADLS Gen2
+    participant CS as CatalogSync
+    participant TGT as MinIO
+    participant NS as Nessie Catalog
+    participant CL as Query Client
+
+    Note over AF,CL: iceberg_sync_adls_to_nessie — triggered every 15 min by Airflow Scheduler
+
+    AF->>CS: IcebergTableSyncOperator.execute()<br/>table=gold/top_customers
+
+    rect rgb(20, 30, 55)
+    Note over AF,TGT: Phase 1 — Discovery  (find_latest_metadata — multi-strategy)
+    CS->>SRC: read_text(metadata/version-hint.text)
+    alt Hadoop catalog — version-hint.text present (fast path)
+        SRC-->>CS: "3"  →  v3.metadata.json
+    else Modern REST catalog — version-hint.text absent
+        SRC-->>CS: FileNotFoundError
+        CS->>SRC: list_objects(metadata/)
+        SRC-->>CS: [00001-abc.metadata.json, 00002-def.metadata.json, 00003-ghi.metadata.json]
+        Note over CS: Parse 5-digit prefix → sort by sequence number<br/>Latest = 00003-ghi.metadata.json (seq 3)
+    end
+    CS->>SRC: read_bytes(metadata/00003-ghi.metadata.json)
+    SRC-->>CS: JSON — location, snapshots, current-snapshot-id
+    CS->>SRC: read_bytes(snap-1000.avro)  manifest-list
+    SRC-->>CS: Avro — manifest_path entries
+    CS->>SRC: read_bytes(m-001.avro)  manifest
+    SRC-->>CS: Avro — data_file.file_path for each file (DATA + delete files)
+    Note over CS: read_snapshot_data_files() — exact file set from manifest chain<br/>Handles custom write.data.path and Iceberg v2 delete files
+    CS->>TGT: list_objects(gold/top_customers/)
+    TGT-->>CS: 177 files already synced
+    Note over CS: Diff: 3 new files to copy, 177 already synced
+    end
+
+    rect rgb(20, 30, 55)
+    Note over CS,TGT: Phase 2 — Incremental Copy (parallel threads)
+    loop 3 new Parquet files
+        CS->>SRC: read_bytes(data/0017N.parquet)
+        SRC-->>CS: bytes
+        CS->>TGT: write_bytes(data/0017N.parquet)
+    end
+    Note over TGT: 180 Parquet files in place on MinIO
+    Note over CS: Abort if any copy failed — target retains previous valid state
+    end
+
+    rect rgb(20, 50, 20)
+    Note over CS,TGT: Phase 3 — Metadata Rewrite (fastavro + PathTranslator)
+    CS->>SRC: read_bytes(metadata/m-001.avro)
+    SRC-->>CS: Avro bytes — manifest with file_path abfss://
+    Note over CS: decode Avro → translate file_path<br/>abfss://iceberg@acct... → s3a://warehouse/
+    CS->>TGT: write_bytes(metadata/m-001.avro)   [s3a:// paths]
+
+    CS->>SRC: read_bytes(metadata/snap-1000.avro)
+    SRC-->>CS: Avro bytes — manifest-list with manifest_path abfss://
+    Note over CS: translate manifest_path → s3a://
+    CS->>TGT: write_bytes(metadata/snap-1000.avro)   [s3a:// paths]
+
+    CS->>SRC: read_bytes(metadata/v3.metadata.json)
+    SRC-->>CS: JSON — location + snapshot paths abfss://
+    Note over CS: translate location, manifest-list,<br/>metadata-log → all s3a://
+    CS->>TGT: write_bytes(metadata/v3.metadata.json)   [s3a:// paths]
+    end
+
+    rect rgb(11, 61, 11)
+    Note over CS,TGT: Phase 4 — Atomic Commit
+    Note over CS: write_version_hint=False when nessie_uri is set<br/>version-hint.text skipped for REST catalog targets
+    CS->>TGT: write_text(metadata/version-hint.text, "3")
+    Note over TGT: Hadoop catalog only — omitted for Nessie targets ✅<br/>All internal URIs are s3a://
+    end
+
+    rect rgb(40, 20, 55)
+    Note over AF,TGT: Phase 5 — Health Check (IcebergHealthCheckOperator)
+    Note over AF: Reads target_metadata_uri from sync XCom output<br/>(does not rely on version-hint.text)
+    AF->>TGT: read_bytes(metadata/00003-ghi.metadata.json)
+    TGT-->>AF: metadata JSON
+    Note over AF: Scan all URIs for source scheme "abfss://" — count = 0 ✅
+    AF->>AF: xcom_push(health_check={healthy:true, metadata_uri:s3a://...})
+    end
+
+    rect rgb(11, 61, 11)
+    Note over AF,NS: Phase 6 — Catalog Registration (NessieCatalogRegisterOperator)
+    AF->>AF: xcom_pull(sync_result.target_metadata_uri)
+    Note over AF: s3a://warehouse/gold/top_customers/metadata/v3.metadata.json
+    AF->>NS: GET /iceberg/v1/namespaces/gold/tables/top_customers
+    alt First sync — table not registered
+        NS-->>AF: 404 Not Found
+        AF->>NS: POST /iceberg/v1/namespaces<br/>{namespace: ["gold"]}
+        NS-->>AF: 200 OK — namespace created
+        AF->>NS: POST /iceberg/v1/namespaces/gold/register<br/>{name: top_customers, metadata-location: s3a://...v3.metadata.json}
+        NS-->>AF: 200 OK — table registered
+    else Incremental — update to new metadata
+        NS-->>AF: 200 OK — current metadata-location: s3a://...v2.metadata.json
+        Note over AF: Pre-capture current pointer for restore safety
+        AF->>NS: DELETE /iceberg/v1/namespaces/gold/tables/top_customers
+        NS-->>AF: 204 No Content
+        AF->>NS: POST /iceberg/v1/namespaces/gold/register<br/>{name: top_customers, metadata-location: s3a://...v3.metadata.json}
+        NS-->>AF: 200 OK — table updated
+        Note over AF: On failure: restore s3a://...v2.metadata.json automatically<br/>Log CRITICAL + manual recovery command if restore also fails
+    end
+    AF->>AF: xcom_push(nessie_result={action:registered, namespace:gold, table:top_customers})
+    Note over NS: gold.top_customers<br/>→ s3a://warehouse/.../v3.metadata.json ✅
+    Note over AF: DAG run complete — all_done task succeeds
+    end
+
+    rect rgb(40, 20, 55)
+    Note over NS,CL: Phase 7 — Client Query (any time after sync completes)
+    CL->>NS: GET /iceberg/v1/namespaces/gold/tables/top_customers
+    NS-->>CL: {metadata-location: s3a://warehouse/.../v3.metadata.json}
+    CL->>TGT: read v3.metadata.json → schema, partitions, snapshot
+    CL->>TGT: read snap-1000.avro → manifest paths
+    CL->>TGT: read m-001.avro → data file list
+    CL->>TGT: scan Parquet files (predicate + column pushdown)
+    TGT-->>CL: row groups
+    Note over CL: SELECT * FROM nessie.gold.top_customers ✅<br/>table.scan().to_arrow().to_pandas()
+    end
+</div>
+</div>
+
+<!-- ═══════════════════ SECTION 1: CORE ENGINE ═══════════════════ -->
+<div class="section-header">Core Engine</div>
+
+<!-- 1. THE PROBLEM -->
+<div class="card">
+<h2>1. The Problem <span>— Why naive file copy fails for Iceberg</span></h2>
+<div class="mermaid">
+flowchart LR
+    subgraph Source["Source (Azure ADLS Gen2)"]
+        M1["metadata.json\nlocation: abfss://iceberg@acct.../gold/top_customers\nmanifest-list: abfss://.../snap-1000.avro"]
+        ML1["snap-1000.avro\nmanifest_path: abfss://.../m-001.avro"]
+        MF1["m-001.avro\nfile_path: abfss://.../data/00001.parquet"]
         D1["00001.parquet"]
         M1 --> ML1 --> MF1 --> D1
     end
 
-    subgraph Azure["Azure ADLS (after naive copy)"]
-        M2["metadata.json\n<b>location:</b> s3://warehouse/... ❌"]
-        ML2["manifest-list.avro\n<b>manifest_path:</b> s3://... ❌"]
-        MF2["manifest.avro\n<b>file_path:</b> s3://... ❌"]
+    subgraph Target["Target (MinIO) — after naive copy"]
+        M2["metadata.json\nlocation: abfss://... ❌ still Azure!"]
+        ML2["snap-1000.avro\nmanifest_path: abfss://... ❌"]
+        MF2["m-001.avro\nfile_path: abfss://... ❌"]
         D2["00001.parquet ✅"]
-        M2 --> ML2 --> MF2 -.->|"points back\nto AWS!"| D1
+        M2 --> ML2 --> MF2 -.->|"points back\nto Azure!"| D1
     end
 
-    AWS -- "azcopy / file sync" --> Azure
+    Source -- "file copy only\n(no metadata rewrite)" --> Target
 
-    style AWS fill:#1a1e2e,stroke:#f0883e,color:#c9d1d9
-    style Azure fill:#1a1e2e,stroke:#da3633,color:#c9d1d9
+    style Source fill:#1a1e2e,stroke:#58a6ff,color:#c9d1d9
+    style Target fill:#1a1e2e,stroke:#da3633,color:#c9d1d9
     style D1 fill:#238636,stroke:#2ea043,color:#fff
     style D2 fill:#238636,stroke:#2ea043,color:#fff
     style M2 fill:#6e1b1b,stroke:#da3633,color:#ffa198
@@ -61,100 +296,115 @@ flowchart LR
 
 <!-- 2. THE SOLUTION -->
 <div class="card">
-<h2>2. The Solution <span>— Sync with metadata rewrite</span></h2>
+<h2>2. The Solution <span>— Incremental sync with metadata rewrite + catalog registration</span></h2>
 <div class="mermaid">
-flowchart TB
+flowchart LR
     subgraph CatalogSync["CatalogSync Orchestrator"]
         direction TB
         S1["① Discover\nfind_latest_metadata()"]
-        S2["② Diff\nCompare data files\n(incremental — new only)"]
+        S2["② Diff\nread_snapshot_data_files()\nmanifest-chain walk — any data layout\nincludes v2 delete files"]
         S3["③ Copy\nTransfer new Parquet files\n(parallel, cross-cloud)"]
         S4["④ Rewrite\nMetadataRewriter\ntranslate every URI"]
-        S5["⑤ Commit\nWrite version-hint.text\n(atomic pointer)"]
-        S1 --> S2 --> S3 --> S4 --> S5
+        S5["⑤ Commit\nversion-hint.text (Hadoop only)\nSkipped for REST catalog targets"]
+        S6["⑥ Register\nNessieCatalog.register_or_update()\n(optional — catalog layer)"]
+        S1 --> S2 --> S3 --> S4 --> S5 --> S6
     end
 
-    subgraph Source["Source (AWS S3)"]
-        SM["metadata.json\ns3://..."]
+    subgraph Source["Source (ADLS Gen2)"]
+        SM["metadata.json\nabfss://..."]
         SD["data/*.parquet"]
     end
 
-    subgraph Target["Target (Azure ADLS)"]
-        TM["metadata.json\nabfss://... ✅"]
+    subgraph Target["Target (MinIO)"]
+        TM["metadata.json\ns3a://... ✅"]
         TD["data/*.parquet ✅"]
+    end
+
+    subgraph Nessie["On-Prem Nessie Catalog"]
+        NC["gold.top_customers\nmetadata-location:\ns3a://warehouse/gold/... ✅"]
     end
 
     Source --> S1
     S3 --> TD
     S4 --> TM
-    S5 -->|"table becomes\nreadable"| Target
+    S5 -->|"files readable"| Target
+    S6 -->|"POST /iceberg/v1/\nnamespaces/gold/register"| Nessie
 
     style CatalogSync fill:#0d1117,stroke:#58a6ff,color:#c9d1d9
-    style Source fill:#1a1e2e,stroke:#f0883e,color:#c9d1d9
-    style Target fill:#1a1e2e,stroke:#7ee787,color:#c9d1d9
+    style Source fill:#1a1e2e,stroke:#58a6ff,color:#c9d1d9
+    style Target fill:#1a1e2e,stroke:#f0883e,color:#c9d1d9
+    style Nessie fill:#1a1e2e,stroke:#7ee787,color:#c9d1d9
     style S1 fill:#1f2937,stroke:#58a6ff,color:#c9d1d9
     style S2 fill:#1f2937,stroke:#58a6ff,color:#c9d1d9
     style S3 fill:#1f2937,stroke:#58a6ff,color:#c9d1d9
     style S4 fill:#1f2937,stroke:#d2a8ff,color:#c9d1d9
     style S5 fill:#1f2937,stroke:#7ee787,color:#c9d1d9
+    style S6 fill:#0b3d0b,stroke:#7ee787,color:#7ee787
 </div>
 </div>
 
 <!-- 3. METADATA REWRITE CHAIN -->
 <div class="card">
-<h2>3. Metadata Rewrite Chain <span>— Every layer is translated</span></h2>
+<h2>3. Metadata Rewrite Chain <span>— Every URI in every Avro record is translated</span></h2>
 <div class="mermaid">
 flowchart TB
-    subgraph Source["Source Metadata (s3://)"]
+    subgraph Source["Source Metadata (abfss://)"]
         direction TB
-        SM["<b>v3.metadata.json</b>\nlocation: s3://warehouse/iceberg/gold/top_customers\nsnapshots[0].manifest-list: s3://.../snap-1000.avro"]
-        SML["<b>snap-1000.avro</b> (manifest-list)\nmanifest_path: s3://.../m-001.avro"]
-        SMF["<b>m-001.avro</b> (manifest)\ndata_file.file_path: s3://.../data/00001.parquet\ndata_file.file_path: s3://.../data/00002.parquet"]
+        SM["v3.metadata.json\nlocation: abfss://iceberg@acct.dfs.core.windows.net/gold/top_customers\nmanifest-list: abfss://.../snap-1000.avro"]
+        SML["snap-1000.avro (manifest-list)\nmanifest_path: abfss://.../m-001.avro"]
+        SMF["m-001.avro (manifest)\ndata_file.file_path: abfss://.../data/00001.parquet\ndata_file.file_path: abfss://.../data/00002.parquet"]
         SM --> SML --> SMF
     end
 
-    PT["<b>PathTranslator</b>\ns3://warehouse/iceberg/\n        ↓\nabfss://iceberg@acct...net/iceberg/"]
+    PT["PathTranslator\nabfss://iceberg@acct.dfs.core.windows.net/\n            ↓\ns3a://warehouse/\n(any → any — configurable)"]
 
-    subgraph Target["Target Metadata (abfss://)"]
+    subgraph Target["Target Metadata (s3a://)"]
         direction TB
-        TM["<b>v3.metadata.json</b>\nlocation: abfss://iceberg@acct...net/iceberg/gold/top_customers\nsnapshots[0].manifest-list: abfss://.../snap-1000.avro"]
-        TML["<b>snap-1000.avro</b> (manifest-list)\nmanifest_path: abfss://.../m-001.avro"]
-        TMF["<b>m-001.avro</b> (manifest)\ndata_file.file_path: abfss://.../data/00001.parquet\ndata_file.file_path: abfss://.../data/00002.parquet"]
+        TM["v3.metadata.json\nlocation: s3a://warehouse/gold/top_customers\nmanifest-list: s3a://.../snap-1000.avro"]
+        TML["snap-1000.avro (manifest-list)\nmanifest_path: s3a://.../m-001.avro"]
+        TMF["m-001.avro (manifest)\ndata_file.file_path: s3a://.../data/00001.parquet\ndata_file.file_path: s3a://.../data/00002.parquet"]
         TM --> TML --> TMF
     end
 
-    VH["<b>version-hint.text</b>\n'3'\n(written LAST)"]
+    VH["version-hint.text  (Hadoop catalog only)\nwrite_version_hint=True → writes sequence number\nwrite_version_hint=False → skipped\n(REST catalog / Nessie targets)"]
+    NC2["Nessie catalog entry  (REST catalog)\ngold.top_customers\nmetadata-location: s3a://.../00003-ghi.metadata.json\nPOST /iceberg/v1/namespaces/gold/register"]
 
     Source --> PT --> Target
-    Target --> VH
+    Target -.->|"Hadoop catalog only"| VH
+    Target -->|"REST catalog target"| NC2
 
-    style Source fill:#1a1e2e,stroke:#f0883e,color:#c9d1d9
-    style Target fill:#1a1e2e,stroke:#7ee787,color:#c9d1d9
+    style Source fill:#1a1e2e,stroke:#58a6ff,color:#c9d1d9
+    style Target fill:#1a1e2e,stroke:#f0883e,color:#c9d1d9
     style PT fill:#1f0d3a,stroke:#d2a8ff,color:#e2c5ff
     style VH fill:#0b3d0b,stroke:#7ee787,color:#7ee787
+    style NC2 fill:#0b3d0b,stroke:#7ee787,color:#7ee787
 </div>
 </div>
 
 <!-- 4. MODULE ARCHITECTURE -->
 <div class="card">
-<h2>4. Module Architecture <span>— Code structure</span></h2>
+<h2>4. Module Architecture <span>— Code structure with catalog layer</span></h2>
 <div class="mermaid">
 flowchart TB
-    CLI["<b>cli.py</b>\niceberg-sync table / namespace\n--dry-run, --parallel"]
-    AF["<b>airflow/operators.py</b>\nIcebergTableSyncOperator\nIcebergNamespaceSyncOperator\nIcebergHealthCheckOperator"]
-    API["<b>Python API</b>\nfrom iceberg_sync.sync import CatalogSync"]
+    subgraph Entry["Entry Points"]
+        CLI["cli.py\niceberg-sync table/namespace\n--nessie-uri --nessie-ref"]
+        AF["airflow/operators.py\nIcebergTableSyncOperator\nIcebergNamespaceSyncOperator\nIcebergHealthCheckOperator\nNessieCatalogRegisterOperator"]
+        API["Python API\nfrom iceberg_sync.sync import CatalogSync\nfrom iceberg_sync.catalog import NessieCatalog"]
+    end
 
-    CS["<b>sync/catalog_sync.py</b>\nCatalogSync\nOrchestrates: diff → copy → rewrite → commit"]
+    CS["sync/catalog_sync.py\nCatalogSync\ndiff → copy → rewrite → commit"]
 
-    PT["<b>path_translator.py</b>\nPathTranslator\nURI mapping: any → any\nReversible for failback"]
+    subgraph Core["Core Libraries"]
+        PT["path_translator.py\nPathTranslator\nany scheme → any\nReversible for failback"]
+        MR["metadata/rewriter.py\nMetadataRewriter\nJSON + fastavro Avro rewrite\nfind_latest_metadata()"]
+        RD["metadata/reader.py\nread_snapshot_data_files()\nmanifest-chain walk\nDATA + POSITION + EQUALITY deletes"]
+    end
 
-    MR["<b>metadata/rewriter.py</b>\nMetadataRewriter\nJSON + Avro rewrite chain\nfind_latest_metadata()"]
-
-    subgraph Storage["<b>storage/</b> — Pluggable backends"]
-        SB["base.py\nStorageBackend\n(abstract)"]
-        S3["s3.py\nS3 + MinIO"]
-        ADLS["adls.py\nADLS Gen2"]
-        GCS["gcs.py\nGoogle Cloud"]
+    subgraph Storage["storage/ — Pluggable backends"]
+        SB["base.py\nStorageBackend (abstract)\nlist/read/write/exists/delete"]
+        S3["s3.py\nAWS S3\nMinIO s3a://"]
+        ADLS["adls.py\nAzure ADLS Gen2\nabfss://"]
+        GCS["gcs.py\nGoogle Cloud\ngs://"]
         MEM["memory.py\nIn-memory\n(tests)"]
         SB --- S3
         SB --- ADLS
@@ -162,148 +412,745 @@ flowchart TB
         SB --- MEM
     end
 
+    subgraph Catalog["catalog/ — REST catalog layer"]
+        NC["nessie.py\nNessieCatalog\nregister_or_update()\nregister_table()  POST /iceberg/v1/.../register\nupdate_table()    DROP + re-register\nping()  list_tables()"]
+    end
+
+    subgraph NessieServer["Nessie REST Server"]
+        NR["POST /iceberg/v1/namespaces/{ns}/register\nGET  /iceberg/v1/namespaces/{ns}/tables/{t}\nDEL  /iceberg/v1/namespaces/{ns}/tables/{t}"]
+    end
+
     CLI --> CS
     AF --> CS
     API --> CS
+    CLI --> NC
+    AF --> NC
+    API --> NC
     CS --> PT
     CS --> MR
+    CS --> RD
     CS --> Storage
     MR --> PT
     MR --> Storage
+    RD --> Storage
+    NC --> NessieServer
 
+    style Entry fill:#0d1117,stroke:#30363d,color:#c9d1d9
     style CLI fill:#1f2937,stroke:#58a6ff,color:#c9d1d9
     style AF fill:#1f2937,stroke:#f0883e,color:#c9d1d9
     style API fill:#1f2937,stroke:#7ee787,color:#c9d1d9
     style CS fill:#0d1117,stroke:#d2a8ff,color:#e2c5ff
+    style Core fill:#0d1117,stroke:#30363d,color:#c9d1d9
     style PT fill:#1f0d3a,stroke:#d2a8ff,color:#e2c5ff
     style MR fill:#1f0d3a,stroke:#d2a8ff,color:#e2c5ff
+    style RD fill:#1f0d3a,stroke:#d2a8ff,color:#e2c5ff
     style Storage fill:#161b22,stroke:#30363d,color:#c9d1d9
     style SB fill:#21262d,stroke:#484f58,color:#c9d1d9
     style S3 fill:#1a1e2e,stroke:#f0883e,color:#c9d1d9
     style ADLS fill:#1a1e2e,stroke:#58a6ff,color:#c9d1d9
     style GCS fill:#1a1e2e,stroke:#7ee787,color:#c9d1d9
-    style MEM fill:#1a1e2e,stroke:#8b949e,color:#c9d1d9
+    style MEM fill:#1a1e2e,stroke:#8b949e,color:#8b949e
+    style Catalog fill:#0b3d0b,stroke:#7ee787,color:#c9d1d9
+    style NC fill:#0d2a0d,stroke:#7ee787,color:#7ee787
+    style NessieServer fill:#1a1e2e,stroke:#7ee787,color:#c9d1d9
+    style NR fill:#21262d,stroke:#7ee787,color:#c9d1d9
 </div>
 </div>
 
-<!-- 5. MULTI-CLOUD FAILOVER (with Airflow) -->
+<!-- ═══════════════════ SECTION 2: ON-PREM POC ═══════════════════ -->
+<div class="section-header">On-Premises POC — Azure Fabric → Nessie</div>
+
+<!-- 5. ON-PREM DOCKER STACK -->
 <div class="card">
-<h2>5. Multi-Cloud Failover Pattern <span>— Airflow-orchestrated active-passive</span></h2>
+<h2>5. On-Prem Docker Stack <span>— docker-compose.yml + docker-compose.airflow.yml</span></h2>
+<div class="mermaid">
+flowchart LR
+    subgraph host["On-Premises Host / VM"]
+        subgraph compose1["docker-compose.yml"]
+            direction TB
+            N["Nessie :19120\nprojectnessie/nessie\nIceberg REST Catalog\n/iceberg/v1  — Spark/Trino/PyIceberg\nIN_MEMORY store (dev)\nROCKSDB (prod)"]
+            MI["MinIO :9000 S3 API\n        :9001 Console\nminio/minio\nOn-prem S3-compatible\nBucket: warehouse"]
+            MC["mc-init\nminio/mc\nCreates 'warehouse' bucket\non first start (restart: no)"]
+            MI -->|"healthy"| MC
+        end
+        subgraph compose2["docker-compose.airflow.yml"]
+            direction TB
+            AW["Airflow Webserver :8080\napache/airflow:2.9.3\nLocalExecutor"]
+            AS["Airflow Scheduler\nRuns DAGs every 15 min"]
+            PG["PostgreSQL :5432\nAirflow metadata DB"]
+            PG -->|"healthy"| AW
+            PG -->|"healthy"| AS
+        end
+        compose1 ~~~ compose2
+    end
+
+    subgraph azure["Azure (Source)"]
+        ADLS2["ADLS Gen2\nabfss://iceberg@acct..."]
+    end
+
+    subgraph clients["Iceberg Clients"]
+        SP["Apache Spark"]
+        TR["Trino"]
+        PY["PyIceberg"]
+        DU["DuckDB"]
+    end
+
+    AS -->|"IcebergTableSyncOperator\ncopies Parquet + rewrites metadata"| MI
+    AS -->|"NessieCatalogRegisterOperator\nPOST /iceberg/v1/namespaces/.../register"| N
+    ADLS2 -->|"source\n(read only)"| AS
+    N -->|"REST catalog\nload_table() / SELECT"| clients
+    MI -->|"s3a:// files\nParquet + Avro"| clients
+
+    style host fill:#0d1117,stroke:#30363d,color:#c9d1d9
+    style compose1 fill:#161b22,stroke:#7ee787,color:#c9d1d9
+    style compose2 fill:#161b22,stroke:#f0883e,color:#c9d1d9
+    style azure fill:#1a1e2e,stroke:#58a6ff,color:#c9d1d9
+    style clients fill:#1a1e2e,stroke:#d2a8ff,color:#c9d1d9
+    style N fill:#0b3d0b,stroke:#7ee787,color:#7ee787
+    style MI fill:#1a1e2e,stroke:#f0883e,color:#c9d1d9
+    style MC fill:#21262d,stroke:#484f58,color:#8b949e
+    style AW fill:#1a1e2e,stroke:#f0883e,color:#c9d1d9
+    style AS fill:#1a1e2e,stroke:#f0883e,color:#c9d1d9
+    style PG fill:#21262d,stroke:#484f58,color:#c9d1d9
+    style ADLS2 fill:#1a1e2e,stroke:#58a6ff,color:#c9d1d9
+</div>
+</div>
+
+<!-- 6. AIRFLOW DAG FACTORY -->
+<div class="card">
+<h2>6. Airflow DAG Factory Pattern <span>— One config entry = one fully-wired DAG</span></h2>
 <div class="mermaid">
 flowchart TB
-    subgraph Airflow["Airflow (neutral zone)"]
-        direction TB
-        PP["<b>Primary Pipeline DAG</b>\nIngest → Bronze → Silver → Gold\n(targets AWS)"]
-        T1["<b>Tier 1 Sync DAG</b>\nGold tables → Azure\n(after every pipeline run)"]
-        T2["<b>Tier 2 Sync DAG</b>\nSilver tables → Azure\n(nightly 2 AM)"]
-        HC["<b>Failover Monitor DAG</b>\nPing AWS every 5 min\nSets FAILOVER_ACTIVE variable"]
-        FP["<b>Failover Pipeline DAG</b>\nSame pipeline code\n(targets Azure Fabric)"]
-
-        PP --> T1
-        PP -.-> T2
-        HC -->|"AWS down"| FP
+    subgraph conf["SYNC_PIPELINES — platform config list\n(airflow_dags/iceberg_sync_dag.py)"]
+        direction LR
+        C1["SyncPipelineConfig\ndag_id: adls_to_nessie\nsource: abfss://\ntarget: s3a://\nnessie_uri: http://nessie:19120\nschedule: every 15 min"]
+        C2["SyncPipelineConfig\ndag_id: s3_to_nessie\nsource: s3://\ntarget: s3a://\nnessie_uri: http://nessie:19120\nschedule: every 15 min"]
+        C3["SyncPipelineConfig\ndag_id: s3_to_adls\nsource: s3://\ntarget: abfss://\nnessie_uri: None\nschedule: trigger-only"]
     end
 
-    subgraph AWS["AWS (Primary)"]
-        S3W["S3\nIceberg Warehouse"]
-        Glue["Glue ETL"]
-        Athena["Athena"]
-        Glue --> S3W
-        S3W --> Athena
+    FAC["make_iceberg_sync_dag(config)\nBuilds one DAG per config entry\nglobals()[config.dag_id] = dag\n→ Airflow auto-discovers all DAGs"]
+
+    conf --> FAC
+
+    subgraph dag1["iceberg_sync_adls_to_nessie  (generated)"]
+        direction LR
+        ST1["start"] --> SY1A["sync_gold_top_customers\nIcebergTableSyncOperator"] --> HE1A["health_gold_top_customers\nIcebergHealthCheckOperator"] --> NE1A["nessie_gold_top_customers\nNessieCatalogRegisterOperator"] --> DO1["all_done"]
+        ST1 --> SY1B["sync_gold_revenue\n..."] --> HE1B["health_gold_revenue\n..."] --> NE1B["nessie_gold_revenue\n..."] --> DO1
     end
 
-    subgraph Azure["Azure (Standby)"]
-        ADLS["ADLS Gen2\nIceberg Warehouse\n(replicated)"]
-        Fabric["Fabric Spark"]
-        FabSQL["Fabric SQL\nEndpoint"]
-        Fabric --> ADLS
-        ADLS --> FabSQL
+    subgraph dag3["iceberg_sync_s3_to_adls  (generated — no Nessie step)"]
+        direction LR
+        ST3["start"] --> SY3["sync_gold_revenue\nIcebergTableSyncOperator"] --> HE3["health_gold_revenue\nIcebergHealthCheckOperator"] --> DO3["all_done"]
     end
 
-    PP --> Glue
-    T1 -->|"CatalogSync\n+ metadata rewrite"| ADLS
-    T2 -->|"CatalogSync\n+ metadata rewrite"| ADLS
-    FP -->|"failover"| Fabric
+    FAC --> dag1
+    FAC -->|"same pattern"| dag2_note["iceberg_sync_s3_to_nessie\n(same as dag1, different source)"]
+    FAC --> dag3
 
-    style Airflow fill:#0d1117,stroke:#f0883e,color:#c9d1d9
-    style AWS fill:#1a1e2e,stroke:#f0883e,color:#c9d1d9
-    style Azure fill:#1a1e2e,stroke:#58a6ff,color:#c9d1d9
-    style PP fill:#1f2937,stroke:#7ee787,color:#c9d1d9
-    style T1 fill:#1f2937,stroke:#d2a8ff,color:#c9d1d9
-    style T2 fill:#1f2937,stroke:#8b949e,color:#c9d1d9
-    style HC fill:#1f2937,stroke:#f85149,color:#c9d1d9
-    style FP fill:#1f2937,stroke:#f85149,color:#ffa198
+    style conf fill:#0d1117,stroke:#30363d,color:#c9d1d9
+    style C1 fill:#1f2937,stroke:#58a6ff,color:#c9d1d9
+    style C2 fill:#1f2937,stroke:#f0883e,color:#c9d1d9
+    style C3 fill:#1f2937,stroke:#8b949e,color:#c9d1d9
+    style FAC fill:#1f0d3a,stroke:#d2a8ff,color:#e2c5ff
+    style dag1 fill:#161b22,stroke:#7ee787,color:#c9d1d9
+    style dag3 fill:#161b22,stroke:#8b949e,color:#c9d1d9
+    style SY1A fill:#1f2937,stroke:#58a6ff,color:#c9d1d9
+    style SY1B fill:#1f2937,stroke:#58a6ff,color:#c9d1d9
+    style HE1A fill:#1f2937,stroke:#d2a8ff,color:#c9d1d9
+    style HE1B fill:#1f2937,stroke:#d2a8ff,color:#c9d1d9
+    style NE1A fill:#0b3d0b,stroke:#7ee787,color:#7ee787
+    style NE1B fill:#0b3d0b,stroke:#7ee787,color:#7ee787
+    style dag2_note fill:#1f2937,stroke:#f0883e,color:#c9d1d9
 </div>
 </div>
 
-<!-- 6. CONSISTENCY TIMELINE -->
+<!-- 7. PLATFORM COVERAGE -->
 <div class="card">
-<h2>6. Sync Consistency Guarantee <span>— Atomic commit via version-hint.text</span></h2>
+<h2>7. Platform Coverage Matrix <span>— Any source → any target → any catalog</span></h2>
+<div class="mermaid">
+flowchart LR
+    subgraph sources["Source Platforms"]
+        ADLS_SRC["Azure Fabric\nADLS Gen2\nabfss://"]
+        S3_SRC["AWS S3\ns3://"]
+        GCS_SRC["Google Cloud\nStorage\ngs://"]
+        MINIO_SRC["MinIO\nOn-prem S3\ns3a://"]
+    end
+
+    subgraph engine["iceberg-catalog-sync engine"]
+        direction TB
+        PT3["PathTranslator\nPure string prefix mapping\nReversible · multi-root · any→any"]
+        MR3["MetadataRewriter\nfastavro byte-level Avro rewrite\nno Spark/JVM dependency"]
+        CS3["CatalogSync\ndiff → copy → rewrite → commit"]
+        NC3["NessieCatalog (optional)\nregister_or_update()\nIceberg REST API"]
+        PT3 --- CS3
+        MR3 --- CS3
+        NC3 --- CS3
+    end
+
+    subgraph targets["Target Storage"]
+        MINIO_TGT["On-prem MinIO\ns3a://\n✅ POC"]
+        ADLS_TGT["Azure ADLS Gen2\nabfss://\n✅ Supported"]
+        S3_TGT["AWS S3\ns3://\n✅ Supported"]
+        GCS_TGT["Google Cloud\nStorage\ngs://\n✅ Supported"]
+    end
+
+    subgraph catalogs["Target Catalogs"]
+        NESSIE_CAT["On-prem Nessie\nIceberg REST\n✅ POC"]
+        GLUE_CAT["AWS Glue\n(native sync)"]
+        UNITY_CAT["Databricks\nUnity Catalog\n(REST compatible)"]
+        POLARIS_CAT["Apache Polaris\n(REST compatible)"]
+    end
+
+    ADLS_SRC -->|"✅ POC"| engine
+    S3_SRC --> engine
+    GCS_SRC --> engine
+    MINIO_SRC -.->|"add HDFSBackend"| engine
+
+    engine --> MINIO_TGT
+    engine --> ADLS_TGT
+    engine --> S3_TGT
+    engine --> GCS_TGT
+
+    engine --> NESSIE_CAT
+    engine -.->|"extend NessieCatalog\n(same REST spec)"| UNITY_CAT
+    engine -.->|"extend NessieCatalog\n(same REST spec)"| POLARIS_CAT
+
+    style sources fill:#1a1e2e,stroke:#58a6ff,color:#c9d1d9
+    style engine fill:#0d1117,stroke:#d2a8ff,color:#e2c5ff
+    style targets fill:#1a1e2e,stroke:#f0883e,color:#c9d1d9
+    style catalogs fill:#0b3d0b,stroke:#7ee787,color:#c9d1d9
+    style ADLS_SRC fill:#21262d,stroke:#58a6ff,color:#c9d1d9
+    style S3_SRC fill:#21262d,stroke:#f0883e,color:#c9d1d9
+    style GCS_SRC fill:#21262d,stroke:#7ee787,color:#c9d1d9
+    style MINIO_SRC fill:#21262d,stroke:#8b949e,color:#8b949e
+    style PT3 fill:#1f0d3a,stroke:#d2a8ff,color:#e2c5ff
+    style MR3 fill:#1f0d3a,stroke:#d2a8ff,color:#e2c5ff
+    style CS3 fill:#1f0d3a,stroke:#d2a8ff,color:#e2c5ff
+    style NC3 fill:#0d2a0d,stroke:#7ee787,color:#7ee787
+    style MINIO_TGT fill:#0b3d0b,stroke:#7ee787,color:#7ee787
+    style ADLS_TGT fill:#21262d,stroke:#58a6ff,color:#c9d1d9
+    style S3_TGT fill:#21262d,stroke:#f0883e,color:#c9d1d9
+    style GCS_TGT fill:#21262d,stroke:#7ee787,color:#c9d1d9
+    style NESSIE_CAT fill:#0b3d0b,stroke:#7ee787,color:#7ee787
+    style GLUE_CAT fill:#21262d,stroke:#f0883e,color:#8b949e
+    style UNITY_CAT fill:#21262d,stroke:#8b949e,color:#8b949e
+    style POLARIS_CAT fill:#21262d,stroke:#8b949e,color:#8b949e
+</div>
+</div>
+
+<!-- ═══════════════════ SECTION 3: OPERATIONS ═══════════════════ -->
+<div class="section-header">Operations</div>
+
+<!-- 8. CONSISTENCY TIMELINE -->
+<div class="card">
+<h2>8. Sync Consistency Guarantee <span>— Atomic commit + catalog registration sequence</span></h2>
 <div class="mermaid">
 sequenceDiagram
-    participant S as Source (AWS S3)
+    participant S as Source ADLS Gen2
     participant CS as CatalogSync
-    participant T as Target (Azure ADLS)
+    participant T as Target MinIO
+    participant N as Nessie Catalog
 
-    Note over S,T: Target may have previous version (v2) or nothing
+    Note over S,N: Target may have previous version v2 or be empty
 
     CS->>S: find_latest_metadata()
-    S-->>CS: v3.metadata.json
+    Note over CS: Strategy 1 — version-hint.text fast path<br/>Strategy 2 — scan 00NNN-UUID.metadata.json<br/>Strategy 3 — read last-updated-ms fallback
+    S-->>CS: 00003-ghi.metadata.json
 
-    CS->>S: list data files
-    CS->>T: list data files (diff)
-    Note over CS: Only new files need copying
+    CS->>S: read manifest-list + manifests
+    Note over CS: read_snapshot_data_files() — walks manifest chain<br/>Returns exact file set — handles custom write.data.path + v2 delete files
+    CS->>T: list_objects table root
+    Note over CS: Diff — only new files need copying<br/>v2 metadata still active on target
 
-    CS->>S: read new data files
-    CS->>T: write new data files
-    Note over T: Data files in place, but v2 metadata<br/>still active — target reads OLD state
+    CS->>S: read new Parquet files
+    CS->>T: write new Parquet files in parallel (thread-safe counters)
+    Note over T: Data files in place — target still reads v2
+    Note over CS: Abort if any copy failed — target retains v2 state
 
-    CS->>S: read manifest (Avro)
-    CS->>CS: rewrite file_path URIs
+    CS->>S: read manifest Avro
+    CS->>CS: translate file_path abfss to s3a
     CS->>T: write rewritten manifest
 
-    CS->>S: read manifest-list (Avro)
-    CS->>CS: rewrite manifest_path URIs
+    CS->>S: read manifest-list Avro
+    CS->>CS: translate manifest_path abfss to s3a
     CS->>T: write rewritten manifest-list
 
     CS->>S: read metadata.json
-    CS->>CS: rewrite location + snapshot paths
-    CS->>T: write rewritten metadata.json
+    CS->>CS: translate location and snapshot paths
+    CS->>T: write rewritten 00003-ghi.metadata.json
 
-    CS->>T: write version-hint.text = "3"
-    Note over T: ATOMIC SWITCH — target now reads v3<br/>All data + metadata in place ✅
+    opt Hadoop catalog target — write_version_hint is True
+        CS->>T: write version-hint.text = 3
+        Note over T: Hadoop pointer updated to v3<br/>Skipped entirely for REST catalog targets
+    end
+
+    Note over T: All data and metadata in place ✅<br/>All internal URIs are s3a://
 
     rect rgb(11, 61, 11)
-    Note over T: Target table is now readable<br/>with all abfss:// paths
+    Note over T: MinIO table is self-consistent<br/>Nessie registration is the authoritative pointer
+    end
+
+    CS->>N: GET /iceberg/v1/namespaces/gold/tables/top_customers
+    Note over CS: Pre-capture current metadata-location for restore safety
+    alt first sync — table not registered
+        N-->>CS: 404 Not Found
+        CS->>N: POST /iceberg/v1/namespaces/gold/register
+        N-->>CS: 200 OK — registered
+    else incremental — update pointer
+        N-->>CS: 200 OK — previous pointer captured
+        CS->>N: DELETE /iceberg/v1/namespaces/gold/tables/top_customers
+        CS->>N: POST /iceberg/v1/namespaces/gold/register new pointer
+        N-->>CS: 200 OK — updated
+        Note over CS: On failure: restore previous pointer automatically<br/>Log CRITICAL + manual recovery if restore also fails
+    end
+
+    rect rgb(11, 61, 11)
+    Note over N: Table queryable via Nessie REST catalog<br/>Spark / Trino / PyIceberg / DuckDB ✅
     end
 </div>
 </div>
 
-<!-- 7. REVERSE SYNC (FAILBACK) -->
+<!-- 9. SOURCE → SYNC ENGINE → TARGET -->
 <div class="card">
-<h2>7. Failback <span>— Reverse sync after AWS recovers</span></h2>
+<h2>9. Source → Sync Engine → Target <span>— Any cloud platform, any direction, any reason</span></h2>
+
+<!-- ── One-liner concept ── -->
+<p style="font-size:0.9rem;color:#8b949e;line-height:1.6;margin-bottom:1.4rem;">
+  The sync engine sits between any Iceberg source and any Iceberg target.
+  The source and target can be cloud platforms, on-premises storage, or both — in either direction.
+  The <em>reason</em> to sync — disaster recovery, data gravity, regulatory residency, cost optimisation —
+  is a business decision. The engine does not care.
+</p>
+
+<!-- ── Core pattern ── -->
+<p style="color:#8b949e;font-size:0.82rem;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:0.6rem;">Core Pattern</p>
+<div class="mermaid">
+flowchart LR
+    subgraph SRC["Source  (where data is written)"]
+        direction TB
+        S1["Azure Fabric\nADLS Gen2  abfss://"]
+        S2["AWS S3  s3://\nGlue Iceberg tables"]
+        S3["Google Cloud Storage\ngs://"]
+        S4["On-prem MinIO\ns3a://"]
+    end
+
+    subgraph ENG["iceberg-catalog-sync"]
+        direction TB
+        D["① Discover\nfind_latest_metadata()\nfilesystem or Iceberg REST endpoint"]
+        DF["② Diff\nread_snapshot_data_files()\nmanifest-chain walk — exact file set"]
+        CP["③ Copy\nincremental — new files only\nparallel threads"]
+        RW["④ Rewrite\nPathTranslator + fastavro\nevery URI translated"]
+        REG["⑤ Register\nNessieCatalog.register_or_update()\nany Iceberg REST catalog"]
+        D --> DF --> CP --> RW --> REG
+    end
+
+    subgraph TGT["Target  (where data lands)"]
+        direction TB
+        T1["On-prem MinIO\ns3a://  + Nessie"]
+        T2["Azure ADLS Gen2\nabfss://  + any catalog"]
+        T3["AWS S3  s3://\n+ Glue / Nessie"]
+        T4["Google Cloud Storage\ngs://"]
+    end
+
+    SRC --> ENG --> TGT
+
+    style SRC fill:#1a1e2e,stroke:#58a6ff,color:#c9d1d9
+    style ENG fill:#0d1117,stroke:#d2a8ff,color:#e2c5ff
+    style TGT fill:#1a1e2e,stroke:#7ee787,color:#c9d1d9
+    style S1 fill:#21262d,stroke:#58a6ff,color:#c9d1d9
+    style S2 fill:#21262d,stroke:#f0883e,color:#c9d1d9
+    style S3 fill:#21262d,stroke:#7ee787,color:#c9d1d9
+    style S4 fill:#21262d,stroke:#8b949e,color:#8b949e
+    style D fill:#1f2937,stroke:#58a6ff,color:#c9d1d9
+    style DF fill:#1f2937,stroke:#58a6ff,color:#c9d1d9
+    style CP fill:#1f2937,stroke:#58a6ff,color:#c9d1d9
+    style RW fill:#1f0d3a,stroke:#d2a8ff,color:#e2c5ff
+    style REG fill:#0b3d0b,stroke:#7ee787,color:#7ee787
+    style T1 fill:#0b3d0b,stroke:#7ee787,color:#7ee787
+    style T2 fill:#21262d,stroke:#58a6ff,color:#c9d1d9
+    style T3 fill:#21262d,stroke:#f0883e,color:#c9d1d9
+    style T4 fill:#21262d,stroke:#7ee787,color:#c9d1d9
+</div>
+
+<!-- ── Use-case boxes ── -->
+<p style="color:#8b949e;font-size:0.82rem;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;margin:1.4rem 0 0.6rem;">Why you might run a sync — same engine for all of these</p>
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1rem;margin-bottom:1.4rem;">
+
+  <div style="background:#0d1117;border:1px solid #d2a8ff;border-radius:8px;padding:1rem;">
+    <div style="color:#d2a8ff;font-weight:700;font-size:0.85rem;margin-bottom:0.5rem;">DATA GRAVITY</div>
+    <p style="font-size:0.82rem;color:#8b949e;line-height:1.5;margin:0 0 0.6rem 0;">
+      Compute lives on-prem or in a different cloud. Move the data closer to eliminate
+      egress latency and cross-cloud query costs. The table is queryable locally with
+      any engine — Spark, Trino, DuckDB, PyIceberg — without touching the source.
+    </p>
+    <div style="font-size:0.78rem;color:#c9d1d9;background:#161b22;border-radius:4px;padding:0.4rem 0.6rem;">
+      Azure Fabric → on-prem MinIO + Nessie<br/>
+      AWS S3 → Azure ADLS (Fabric compute)<br/>
+      GCS → on-prem MinIO + Nessie
+    </div>
+  </div>
+
+  <div style="background:#0d1117;border:1px solid #f0883e;border-radius:8px;padding:1rem;">
+    <div style="color:#f0883e;font-weight:700;font-size:0.85rem;margin-bottom:0.5rem;">DISASTER RECOVERY</div>
+    <p style="font-size:0.82rem;color:#8b949e;line-height:1.5;margin:0 0 0.6rem 0;">
+      Keep a warm copy of critical tables on a second platform. If the primary becomes
+      unavailable, the standby catalog is already populated and queryable.
+      <code style="color:#f0883e;">PathTranslator.reverse()</code> syncs new data back
+      after recovery — no code change required.
+    </p>
+    <div style="font-size:0.78rem;color:#c9d1d9;background:#161b22;border-radius:4px;padding:0.4rem 0.6rem;">
+      Primary Azure ADLS → Standby AWS S3<br/>
+      Primary AWS S3 → Standby on-prem<br/>
+      Primary Azure → Standby on-prem Nessie
+    </div>
+  </div>
+
+  <div style="background:#0d1117;border:1px solid #58a6ff;border-radius:8px;padding:1rem;">
+    <div style="color:#58a6ff;font-weight:700;font-size:0.85rem;margin-bottom:0.5rem;">REGULATORY RESIDENCY</div>
+    <p style="font-size:0.82rem;color:#8b949e;line-height:1.5;margin:0 0 0.6rem 0;">
+      Data must reside in a specific geography or jurisdiction. Sync a compliant copy
+      into a region-locked storage account — source is never modified, target holds
+      a fully self-consistent Iceberg table with translated URIs.
+    </p>
+    <div style="font-size:0.78rem;color:#c9d1d9;background:#161b22;border-radius:4px;padding:0.4rem 0.6rem;">
+      Global S3 → EU-only ADLS (GDPR)<br/>
+      Azure global → sovereign cloud region<br/>
+      Any cloud → air-gapped on-prem
+    </div>
+  </div>
+
+</div>
+
+<!-- ── Worked example combinations ── -->
+<p style="color:#8b949e;font-size:0.82rem;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:0.6rem;">Worked Example Combinations — one PathTranslator mapping per pair</p>
+<div class="mermaid">
+flowchart LR
+    subgraph ex1["Azure → On-prem  (this POC)"]
+        direction LR
+        EA["ADLS Gen2\nabfss://iceberg@acct...\ngold/top_customers"]
+        EB["MinIO + Nessie\ns3a://warehouse/\ngold/top_customers"]
+        EA -->|"abfss to s3a"| EB
+    end
+
+    subgraph ex2["AWS → On-prem"]
+        direction LR
+        FA["AWS S3\ns3://my-warehouse/\ngold/top_customers"]
+        FB["MinIO + Nessie\ns3a://warehouse/\ngold/top_customers"]
+        FA -->|"s3 to s3a"| FB
+    end
+
+    subgraph ex3["AWS → Azure  (cross-cloud)"]
+        direction LR
+        GA["AWS S3\ns3://my-warehouse/\ngold/revenue"]
+        GB["ADLS Gen2\nabfss://iceberg@acct...\ngold/revenue"]
+        GA -->|"s3 to abfss"| GB
+    end
+
+    subgraph ex4["Azure → AWS  (reverse direction)"]
+        direction LR
+        HA["ADLS Gen2\nabfss://iceberg@acct...\ngold/revenue"]
+        HB["AWS S3\ns3://my-warehouse/\ngold/revenue"]
+        HA -->|"abfss to s3\ntranslator.reverse()"| HB
+    end
+
+    style ex1 fill:#161b22,stroke:#7ee787,color:#c9d1d9
+    style ex2 fill:#161b22,stroke:#f0883e,color:#c9d1d9
+    style ex3 fill:#161b22,stroke:#58a6ff,color:#c9d1d9
+    style ex4 fill:#161b22,stroke:#d2a8ff,color:#c9d1d9
+    style EA fill:#21262d,stroke:#58a6ff,color:#c9d1d9
+    style EB fill:#0b3d0b,stroke:#7ee787,color:#7ee787
+    style FA fill:#21262d,stroke:#f0883e,color:#c9d1d9
+    style FB fill:#0b3d0b,stroke:#7ee787,color:#7ee787
+    style GA fill:#21262d,stroke:#f0883e,color:#c9d1d9
+    style GB fill:#21262d,stroke:#58a6ff,color:#c9d1d9
+    style HA fill:#21262d,stroke:#58a6ff,color:#c9d1d9
+    style HB fill:#21262d,stroke:#f0883e,color:#c9d1d9
+</div>
+
+<!-- ── What changes vs stays the same ── -->
+<table style="width:100%;border-collapse:collapse;font-size:0.82rem;margin-top:1.2rem;">
+  <thead>
+    <tr style="background:#161b22;color:#8b949e;text-align:left;">
+      <th style="padding:0.5rem 0.75rem;border:1px solid #21262d;">What changes per deployment</th>
+      <th style="padding:0.5rem 0.75rem;border:1px solid #21262d;">What never changes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style="background:#0d1117;">
+      <td style="padding:0.6rem 0.75rem;border:1px solid #21262d;color:#c9d1d9;vertical-align:top;">
+        <code style="color:#f0883e;">--source-root</code> and <code style="color:#f0883e;">--target-root</code> URIs<br/>
+        Storage credentials (ADLS key / AWS keys / GCS service account)<br/>
+        <code style="color:#f0883e;">--nessie-uri</code> if a different catalog is the target<br/>
+        Airflow DAG schedule (every 15 min / nightly / on-demand)
+      </td>
+      <td style="padding:0.6rem 0.75rem;border:1px solid #21262d;color:#c9d1d9;vertical-align:top;">
+        <code style="color:#7ee787;">CatalogSync</code> orchestration logic<br/>
+        <code style="color:#7ee787;">MetadataRewriter</code> + fastavro Avro rewrite<br/>
+        <code style="color:#7ee787;">read_snapshot_data_files()</code> manifest-chain walk<br/>
+        <code style="color:#7ee787;">NessieCatalog</code> Iceberg REST client<br/>
+        Airflow operators and DAG factory
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ── Example 1: AWS S3 → On-prem ── -->
+<p style="color:#8b949e;font-size:0.82rem;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;margin:1.4rem 0 0.6rem;">Example 1 — AWS S3 → On-Prem Nessie + MinIO</p>
+<!-- Example 1 diagram -->
+<div class="mermaid">
+flowchart LR
+    subgraph aws1["AWS  (source)"]
+        direction TB
+        S3A["AWS S3  s3://my-warehouse/iceberg/\ngold/top_customers/\n  metadata/  data/"]
+        GLUE["AWS Glue\nIceberg table writer"]
+        GLUE -->|"writes Iceberg"| S3A
+    end
+
+    subgraph eng1["iceberg-catalog-sync"]
+        direction TB
+        E1A["\u2460 Discover + Diff\nfilesystem scan or Glue REST endpoint\nread_snapshot_data_files() manifest walk"]
+        E1B["\u2461 Copy  new Parquet only\ns3:// read  s3a:// write \u2014 parallel"]
+        E1C["\u2462 Rewrite  PathTranslator\ns3://my-warehouse \u2192 s3a://warehouse"]
+        E1D["\u2463 Register  NessieCatalog\nPOST /iceberg/v1/namespaces/gold/register"]
+        E1A --> E1B --> E1C --> E1D
+    end
+
+    subgraph onprem1["On-Premises  (target)"]
+        direction TB
+        MINIO1["MinIO  s3a://warehouse/\ngold/top_customers/\n  metadata/  data/  \u2014 all s3a:// \u2705"]
+        NESSIE1["Nessie Catalog  :19120\ngold.top_customers\nmetadata-location: s3a://warehouse/..."]
+        MINIO1 --- NESSIE1
+    end
+
+    subgraph cl1["Query Engines"]
+        direction TB
+        SP1["Spark"]
+        TR1["Trino"]
+        DU1["DuckDB / PyIceberg"]
+    end
+
+    aws1 --> eng1 --> onprem1
+    NESSIE1 -->|"load_table()"| cl1
+    MINIO1 -->|"s3a:// scan"| cl1
+
+    style aws1 fill:#1a1e2e,stroke:#f0883e,color:#c9d1d9
+    style eng1 fill:#0d1117,stroke:#d2a8ff,color:#e2c5ff
+    style onprem1 fill:#1a1e2e,stroke:#7ee787,color:#c9d1d9
+    style cl1 fill:#1a1e2e,stroke:#d2a8ff,color:#c9d1d9
+    style S3A fill:#21262d,stroke:#f0883e,color:#c9d1d9
+    style GLUE fill:#21262d,stroke:#f0883e,color:#c9d1d9
+    style E1A fill:#1f2937,stroke:#58a6ff,color:#c9d1d9
+    style E1B fill:#1f2937,stroke:#58a6ff,color:#c9d1d9
+    style E1C fill:#1f0d3a,stroke:#d2a8ff,color:#e2c5ff
+    style E1D fill:#0b3d0b,stroke:#7ee787,color:#7ee787
+    style MINIO1 fill:#21262d,stroke:#f0883e,color:#c9d1d9
+    style NESSIE1 fill:#0d2a0d,stroke:#7ee787,color:#7ee787
+</div>
+
+<div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:1rem;margin:1rem 0;font-size:0.82rem;">
+  <div style="color:#58a6ff;font-weight:700;margin-bottom:0.5rem;">Demo &mdash; prerequisites: <code style="color:#f0883e;">docker compose -f docker/docker-compose.yml up -d</code> &amp; <code style="color:#f0883e;">pip install -e ".[nessie]"</code></div>
+  <pre style="margin:0;color:#c9d1d9;line-height:1.6;overflow-x:auto;background:#161b22;padding:0.75rem;border-radius:6px;"><code><span style="color:#8b949e;"># 1. Single table &mdash; filesystem discovery (default)</span>
+iceberg-sync table \
+  --source-root   "s3://my-warehouse/iceberg/" \
+  --target-root   "s3a://warehouse/" \
+  --table         "gold/top_customers" \
+  --source-region eu-west-2 \
+  --target-endpoint    http://localhost:9000 \
+  --target-access-key  minioadmin \
+  --target-secret-key  minioadmin \
+  --nessie-uri    http://localhost:19120
+
+<span style="color:#8b949e;"># 2. Whole namespace (all tables under gold/)</span>
+iceberg-sync namespace \
+  --source-root   "s3://my-warehouse/iceberg/" \
+  --target-root   "s3a://warehouse/" \
+  --namespace     "gold" \
+  --source-region eu-west-2 \
+  --target-endpoint    http://localhost:9000 \
+  --target-access-key  minioadmin \
+  --target-secret-key  minioadmin \
+  --nessie-uri    http://localhost:19120
+
+<span style="color:#8b949e;"># 3. Supply metadata_location from Glue &mdash; skips filesystem scan entirely</span>
+METADATA=$(aws glue get-table \
+  --database-name gold --name top_customers \
+  --query 'Table.Parameters.metadata_location' --output text)
+
+iceberg-sync table \
+  --source-root        "s3://my-warehouse/iceberg/" \
+  --target-root        "s3a://warehouse/" \
+  --table              "gold/top_customers" \
+  --source-region      eu-west-2 \
+  --metadata-location  "$METADATA" \
+  --target-endpoint    http://localhost:9000 \
+  --target-access-key  minioadmin \
+  --target-secret-key  minioadmin \
+  --nessie-uri    http://localhost:19120
+
+<span style="color:#8b949e;"># 4. Query result via PyIceberg</span>
+from pyiceberg.catalog.rest import RestCatalog
+catalog = RestCatalog("nessie", **{
+    "uri": "http://localhost:19120/iceberg",
+    "s3.endpoint": "http://localhost:9000",
+    "s3.access-key-id": "minioadmin",
+    "s3.secret-access-key": "minioadmin",
+    "s3.path-style-access": "true",
+})
+df = catalog.load_table(("gold", "top_customers")).scan().to_arrow().to_pandas()
+print(df.head())</code></pre>
+</div>
+
+<!-- Example 2 -->
+<p style="color:#8b949e;font-size:0.82rem;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;margin:1.8rem 0 0.6rem;">Example 2 &mdash; AWS S3 &rarr; Azure ADLS Gen2  (cross-cloud, no on-prem needed)</p>
+
+<div style="background:#0d1117;border:1px solid #58a6ff;border-radius:8px;padding:0.75rem 1rem;font-size:0.82rem;color:#8b949e;line-height:1.5;margin-bottom:0.8rem;">
+  Only the target URI and credentials change &mdash; the engine, discovery, diff, copy, and rewrite logic is identical to Example 1.
+  The sync engine can run anywhere with network access to both endpoints: on-prem, in AWS, in Azure, or a neutral host.
+</div>
+
+<div class="mermaid">
+flowchart LR
+    subgraph aws2["AWS  (source)"]
+        direction TB
+        S3B["AWS S3  s3://my-warehouse/iceberg/\ngold/top_customers/"]
+        GLUE2["AWS Glue\nIceberg table writer"]
+        GLUE2 -->|"writes Iceberg"| S3B
+    end
+
+    subgraph eng2["iceberg-catalog-sync"]
+        direction TB
+        E2A["\u2460 Discover + Diff\nread manifest-chain from s3://"]
+        E2B["\u2461 Copy  new Parquet\ns3:// read  abfss:// write"]
+        E2C["\u2462 Rewrite  PathTranslator\ns3://my-warehouse \u2192 abfss://iceberg@acct..."]
+        E2D["\u2463 Register  optional\nFabric Iceberg REST or Nessie on Azure"]
+        E2A --> E2B --> E2C --> E2D
+    end
+
+    subgraph azure2["Azure  (target)"]
+        direction TB
+        ADLS2["ADLS Gen2  abfss://iceberg@acct.../\ngold/top_customers/\n  metadata/  data/  \u2014 all abfss:// \u2705"]
+        FAB2["Azure Fabric Lakehouse\nor Nessie on Azure"]
+        ADLS2 --- FAB2
+    end
+
+    aws2 --> eng2 --> azure2
+
+    style aws2 fill:#1a1e2e,stroke:#f0883e,color:#c9d1d9
+    style eng2 fill:#0d1117,stroke:#d2a8ff,color:#e2c5ff
+    style azure2 fill:#1a1e2e,stroke:#58a6ff,color:#c9d1d9
+    style S3B fill:#21262d,stroke:#f0883e,color:#c9d1d9
+    style GLUE2 fill:#21262d,stroke:#f0883e,color:#c9d1d9
+    style E2A fill:#1f2937,stroke:#58a6ff,color:#c9d1d9
+    style E2B fill:#1f2937,stroke:#58a6ff,color:#c9d1d9
+    style E2C fill:#1f0d3a,stroke:#d2a8ff,color:#e2c5ff
+    style E2D fill:#0b3d0b,stroke:#7ee787,color:#7ee787
+    style ADLS2 fill:#21262d,stroke:#58a6ff,color:#c9d1d9
+    style FAB2 fill:#21262d,stroke:#58a6ff,color:#c9d1d9
+</div>
+
+<div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:1rem;margin:1rem 0;font-size:0.82rem;">
+  <div style="color:#58a6ff;font-weight:700;margin-bottom:0.5rem;">Demo &mdash; AWS S3 &rarr; Azure ADLS</div>
+  <pre style="margin:0;color:#c9d1d9;line-height:1.6;overflow-x:auto;background:#161b22;padding:0.75rem;border-radius:6px;"><code><span style="color:#8b949e;"># 1. Dry run &mdash; see what would be copied without writing anything</span>
+iceberg-sync table --dry-run \
+  --source-root        "s3://my-warehouse/iceberg/" \
+  --target-root        "abfss://iceberg@mystorageacct.dfs.core.windows.net/" \
+  --table              "gold/top_customers" \
+  --source-region      eu-west-2 \
+  --target-account-name  mystorageacct \
+  --target-account-key   "$AZURE_STORAGE_KEY"
+
+<span style="color:#8b949e;"># 2. Live sync</span>
+iceberg-sync table \
+  --source-root        "s3://my-warehouse/iceberg/" \
+  --target-root        "abfss://iceberg@mystorageacct.dfs.core.windows.net/" \
+  --table              "gold/top_customers" \
+  --source-region      eu-west-2 \
+  --target-account-name  mystorageacct \
+  --target-account-key   "$AZURE_STORAGE_KEY"
+
+<span style="color:#8b949e;"># 3. Python API &mdash; identical pattern, just different URIs</span>
+from iceberg_sync.path_translator import PathTranslator
+from iceberg_sync.storage import create_storage
+from iceberg_sync.sync import CatalogSync
+
+translator = PathTranslator([
+    ("s3://my-warehouse/iceberg/",
+     "abfss://iceberg@mystorageacct.dfs.core.windows.net/")
+])
+sync = CatalogSync(
+    translator=translator,
+    source_storage=create_storage("s3://my-warehouse/iceberg/", region_name="eu-west-2"),
+    target_storage=create_storage(
+        "abfss://iceberg@mystorageacct.dfs.core.windows.net/",
+        storage_account_name="mystorageacct",
+        storage_account_key="...",
+    ),
+)
+result = sync.sync_table("s3://my-warehouse/iceberg/gold/top_customers/")
+print(f"Copied {result.files_copied} files")</code></pre>
+</div>
+
+<!-- Where to place the sync engine -->
+<p style="color:#8b949e;font-size:0.82rem;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;margin:1.4rem 0 0.6rem;">Where to place the sync engine</p>
+<table style="width:100%;border-collapse:collapse;font-size:0.82rem;">
+  <thead>
+    <tr style="background:#161b22;color:#8b949e;text-align:left;">
+      <th style="padding:0.5rem 0.75rem;border:1px solid #21262d;">Placement</th>
+      <th style="padding:0.5rem 0.75rem;border:1px solid #21262d;">Best for</th>
+      <th style="padding:0.5rem 0.75rem;border:1px solid #21262d;">Notes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style="background:#0d1117;">
+      <td style="padding:0.5rem 0.75rem;border:1px solid #21262d;color:#7ee787;font-weight:700;">On-prem Airflow</td>
+      <td style="padding:0.5rem 0.75rem;border:1px solid #21262d;color:#c9d1d9;">Cloud &rarr; on-prem (Example 1)</td>
+      <td style="padding:0.5rem 0.75rem;border:1px solid #21262d;color:#8b949e;">Engine runs on-prem, reads from cloud, writes to local MinIO. No cloud compute cost for the sync.</td>
+    </tr>
+    <tr style="background:#0d1117;">
+      <td style="padding:0.5rem 0.75rem;border:1px solid #21262d;color:#f0883e;font-weight:700;">AWS &mdash; Glue Job / ECS</td>
+      <td style="padding:0.5rem 0.75rem;border:1px solid #21262d;color:#c9d1d9;">AWS S3 &rarr; Azure ADLS (Example 2)</td>
+      <td style="padding:0.5rem 0.75rem;border:1px solid #21262d;color:#8b949e;">S3 reads are free within the same AWS region. Orchestrated by MWAA or Step Functions.</td>
+    </tr>
+    <tr style="background:#0d1117;">
+      <td style="padding:0.5rem 0.75rem;border:1px solid #21262d;color:#58a6ff;font-weight:700;">Azure ADF / AKS Pod</td>
+      <td style="padding:0.5rem 0.75rem;border:1px solid #21262d;color:#c9d1d9;">Azure ADLS &rarr; AWS S3 or on-prem</td>
+      <td style="padding:0.5rem 0.75rem;border:1px solid #21262d;color:#8b949e;">ADLS reads are free within Azure. ADF wraps the CLI as a custom activity or calls the Python API.</td>
+    </tr>
+    <tr style="background:#0d1117;">
+      <td style="padding:0.5rem 0.75rem;border:1px solid #21262d;color:#d2a8ff;font-weight:700;">Neutral host / VM</td>
+      <td style="padding:0.5rem 0.75rem;border:1px solid #21262d;color:#c9d1d9;">Any cross-cloud pair</td>
+      <td style="padding:0.5rem 0.75rem;border:1px solid #21262d;color:#8b949e;">Place in the region closest to both storage endpoints to minimise round-trip latency.</td>
+    </tr>
+  </tbody>
+</table>
+
+</div>
+
+
+<!-- 10. FAILBACK -->
+<div class="card">
+<h2>10. Failback <span>— PathTranslator.reverse() enables any-direction sync</span></h2>
 <div class="mermaid">
 flowchart LR
     subgraph Normal["Normal Operation"]
         direction LR
-        A1["AWS S3\n(primary)"]
-        B1["Azure ADLS\n(standby)"]
-        A1 -->|"CatalogSync\ns3:// → abfss://"| B1
+        A1["Azure ADLS\n(primary source)"]
+        B1["On-prem MinIO\n+ Nessie\n(standby)"]
+        A1 -->|"CatalogSync\nabfss:// → s3a://"| B1
     end
 
-    subgraph Failover["During AWS Outage"]
+    subgraph Failover["During Azure Outage"]
         direction LR
-        A2["AWS S3\n(down ❌)"]
-        B2["Azure ADLS\n(active)"]
-        F2["Fabric Spark\n(running pipeline)"]
-        F2 --> B2
+        A2["Azure ADLS\n(unreachable ❌)"]
+        B2["On-prem MinIO\n+ Nessie\n(serving queries)"]
+        B2 -->|"last synced\nsnapshot"| Q2["On-prem Spark\nTrino / DuckDB"]
     end
 
-    subgraph Failback["After AWS Recovers"]
+    subgraph Failback["After Azure Recovers"]
         direction LR
-        B3["Azure ADLS\n(has new data)"]
-        A3["AWS S3\n(recovered)"]
-        B3 -->|"CatalogSync.reverse()\nabfss:// → s3://"| A3
+        B3["On-prem MinIO\n(has new data)"]
+        A3["Azure ADLS\n(recovered)"]
+        B3 -->|"CatalogSync\ntranslator.reverse()\ns3a:// → abfss://"| A3
     end
 
     Normal --> Failover --> Failback
@@ -315,14 +1162,14 @@ flowchart LR
 </div>
 </div>
 
-<!-- 8. DATA TIERING -->
+<!-- 11. REPLICATION TIERS -->
 <div class="card">
-<h2>8. Replication Tiers <span>— Not everything needs real-time sync</span></h2>
+<h2>11. Replication Tiers <span>— Match sync frequency to business criticality</span></h2>
 <div class="mermaid">
 flowchart LR
     subgraph Tier1["Tier 1 — Hot (Gold)"]
-        G1["revenue_by_order_date"]
-        G2["top_customers"]
+        G1["gold.revenue_by_order_date"]
+        G2["gold.top_customers"]
     end
 
     subgraph Tier2["Tier 2 — Warm (Silver)"]
@@ -336,20 +1183,27 @@ flowchart LR
         R1["raw CSVs"]
     end
 
-    Tier1 -->|"Sync after every\npipeline run\nRPO: ~minutes"| AZ1["Azure Gold ✅"]
-    Tier2 -->|"Nightly sync\nRPO: ~24 hours"| AZ2["Azure Silver"]
-    Tier3 -->|"Weekly / on-demand\nRPO: ~7 days"| AZ3["Azure Bronze"]
+    subgraph OnPremNessie["On-Prem Nessie + MinIO"]
+        T1N["nessie.gold.*\nRPO: ~15 min\nAirflow: every 15 min"]
+        T2N["nessie.silver.*\nRPO: ~24 hours\nAirflow: nightly 2 AM"]
+        T3N["nessie.bronze.*\nRPO: ~7 days\nAirflow: weekly / on-demand"]
+    end
+
+    Tier1 -->|"sync after every\npipeline run\n+ Nessie registration"| T1N
+    Tier2 -->|"nightly sync\n+ Nessie registration"| T2N
+    Tier3 -->|"weekly / on-demand"| T3N
 
     style Tier1 fill:#0b3d0b,stroke:#7ee787,color:#7ee787
     style Tier2 fill:#1a1e2e,stroke:#58a6ff,color:#c9d1d9
     style Tier3 fill:#1a1e2e,stroke:#8b949e,color:#8b949e
-    style AZ1 fill:#0b3d0b,stroke:#7ee787,color:#7ee787
-    style AZ2 fill:#1a1e2e,stroke:#58a6ff,color:#c9d1d9
-    style AZ3 fill:#1a1e2e,stroke:#8b949e,color:#8b949e
+    style OnPremNessie fill:#0d1117,stroke:#7ee787,color:#c9d1d9
+    style T1N fill:#0b3d0b,stroke:#7ee787,color:#7ee787
+    style T2N fill:#1a1e2e,stroke:#58a6ff,color:#c9d1d9
+    style T3N fill:#1a1e2e,stroke:#8b949e,color:#8b949e
 </div>
 </div>
 
-</div>
+</div><!-- /grid -->
 
 <script>
 mermaid.initialize({

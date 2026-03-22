@@ -61,17 +61,21 @@ class MetadataRewriter:
 
     Usage:
         translator = PathTranslator([
-            ("s3://warehouse/iceberg/", "abfss://iceberg@acct.dfs.core.windows.net/iceberg/"),
+            ("abfss://iceberg@acct.dfs.core.windows.net/", "s3a://warehouse/"),
         ])
 
         rewriter = MetadataRewriter(
             translator=translator,
-            source_storage=s3_backend,
-            target_storage=adls_backend,
+            source_storage=adls_backend,
+            target_storage=minio_backend,
+            # write_version_hint=False when Nessie (or any REST catalog) is the
+            # target catalog — the catalog server tracks the current metadata
+            # pointer, not version-hint.text on disk.
+            write_version_hint=False,
         )
 
         stats = rewriter.rewrite_table(
-            source_metadata_uri="s3://warehouse/iceberg/gold/top_customers/metadata/v3.metadata.json"
+            source_metadata_uri="abfss://iceberg@acct.../gold/top_customers/metadata/00003-abc.metadata.json"
         )
     """
 
@@ -81,11 +85,13 @@ class MetadataRewriter:
         source_storage: StorageBackend,
         target_storage: StorageBackend,
         rewrite_all_snapshots: bool = False,
+        write_version_hint: bool = True,
     ):
         self._translator = translator
         self._source = source_storage
         self._target = target_storage
         self._rewrite_all = rewrite_all_snapshots
+        self._write_version_hint_flag = write_version_hint
 
     def rewrite_table(self, source_metadata_uri: str) -> RewriteStats:
         """
@@ -143,6 +149,13 @@ class MetadataRewriter:
                 snapshot["manifest-list"] = self._translator.translate(manifest_list_uri)
 
         # ── Rewrite metadata-log and previous-metadata paths ─────────────
+        # Capture original URIs BEFORE translating — needed to read the source
+        # files when we rewrite historical metadata below.
+        historical_metadata_uris = [
+            entry["metadata-file"]
+            for entry in metadata.get("metadata-log", [])
+            if "metadata-file" in entry
+        ]
         for log_entry in metadata.get("metadata-log", []):
             if "metadata-file" in log_entry:
                 log_entry["metadata-file"] = self._translator.translate(
@@ -156,8 +169,14 @@ class MetadataRewriter:
         stats.metadata_files_rewritten += 1
         log.info(f"Wrote target metadata: {target_metadata_uri}")
 
+        # ── Rewrite historical metadata files referenced in metadata-log ────
+        # Iceberg 1.4+ reads these to reconstruct lastAddedSchemaId.  Without
+        # them on the target the table appears schema-less to Spark.
+        for hist_uri in historical_metadata_uris:
+            self._rewrite_historical_metadata(hist_uri, stats)
+
         # ── Write version-hint.text (atomic pointer) ─────────────────────
-        self._write_version_hint(source_metadata_uri, target_metadata_uri)
+        self._write_version_hint(target_metadata_uri)
 
         log.info(
             f"Rewrite complete: {stats.metadata_files_rewritten} metadata, "
@@ -166,6 +185,64 @@ class MetadataRewriter:
             f"{stats.data_file_paths_translated} data file paths translated"
         )
         return stats
+
+    def _rewrite_historical_metadata(self, source_uri: str, stats: RewriteStats) -> None:
+        """
+        Translate paths in a historical metadata.json and write it to the target.
+
+        Historical metadata files are referenced in metadata-log.  Iceberg 1.4+
+        reads them during table load to reconstruct lastAddedSchemaId.  We only
+        translate URI fields — we do NOT re-process manifests (the raw Avro files
+        were already copied by the data-file sync step).
+
+        Skips silently if the file already exists on the target or cannot be read
+        from the source (e.g. retention-deleted on the source).
+        """
+        target_uri = self._translator.translate(source_uri, strict=False)
+        if target_uri == source_uri:
+            log.debug(f"Cannot translate historical metadata URI, skipping: {source_uri}")
+            return
+
+        try:
+            if self._target.exists(target_uri):
+                log.debug(f"Historical metadata already on target: {target_uri}")
+                return
+        except Exception:
+            pass
+
+        try:
+            raw = self._source.read_bytes(source_uri)
+        except Exception as e:
+            log.debug(f"Cannot read historical metadata {source_uri}: {e} — skipping")
+            return
+
+        try:
+            hist_meta = json.loads(raw)
+        except Exception as e:
+            log.debug(f"Cannot parse historical metadata {source_uri}: {e} — skipping")
+            return
+
+        if "location" in hist_meta:
+            hist_meta["location"] = self._translator.translate(
+                hist_meta["location"], strict=False
+            )
+        for snap in hist_meta.get("snapshots", []):
+            if "manifest-list" in snap:
+                snap["manifest-list"] = self._translator.translate(
+                    snap["manifest-list"], strict=False
+                )
+        for entry in hist_meta.get("metadata-log", []):
+            if "metadata-file" in entry:
+                entry["metadata-file"] = self._translator.translate(
+                    entry["metadata-file"], strict=False
+                )
+
+        self._target.write_bytes(
+            target_uri,
+            json.dumps(hist_meta, indent=2, default=str).encode("utf-8"),
+        )
+        stats.metadata_files_rewritten += 1
+        log.debug(f"Wrote historical metadata: {target_uri}")
 
     def _rewrite_manifest_list(self, source_uri: str, stats: RewriteStats) -> str:
         """
@@ -232,76 +309,168 @@ class MetadataRewriter:
         stats.manifests_rewritten += 1
         return target_uri
 
-    def _write_version_hint(self, source_metadata_uri: str, target_metadata_uri: str):
+    def _write_version_hint(self, target_metadata_uri: str) -> None:
         """
-        Write version-hint.text to the target table's metadata directory.
+        Optionally write version-hint.text for Hadoop/filesystem catalog targets.
 
-        This file contains a single integer — the version number of the current
-        metadata file.  Iceberg Hadoop catalog reads this to find the latest
-        metadata.json without listing the metadata directory.
+        version-hint.text is a Hadoop catalog convention — it contains a single
+        integer that points to the current v{N}.metadata.json without requiring
+        a directory listing.  It does NOT exist in tables managed by REST catalogs
+        (Nessie, Glue, Polaris, Unity Catalog, Azure Fabric).
 
-        Written LAST so the target table only becomes readable once all
-        manifests and data files are in place.
+        Skip this entirely when self._write_version_hint is False, which should
+        be the case whenever a REST catalog (e.g. Nessie) is the authoritative
+        pointer — writing the file would be misleading and wasteful.
+
+        Handles both metadata naming schemes:
+          v{N}.metadata.json             → writes N
+          {NNNNN}-{UUID}.metadata.json   → writes the 5-digit sequence number
+                                           (stripped of leading zeros)
         """
-        # Extract version number from filename: v3.metadata.json → 3
-        import re
-        filename = target_metadata_uri.rsplit("/", 1)[-1]
-        match = re.match(r"v(\d+)\.metadata\.json", filename)
-        if not match:
-            log.warning(f"Cannot extract version from metadata filename: {filename}")
+        if not self._write_version_hint_flag:
+            log.debug("Skipping version-hint.text — REST catalog target, pointer lives in catalog")
             return
 
-        version = match.group(1)
+        import re
+        filename = target_metadata_uri.rsplit("/", 1)[-1]
 
-        # version-hint.text lives in the same metadata/ directory
+        # Modern Iceberg naming: 00003-550e8400-....metadata.json → "3"
+        modern = re.match(r"^(\d{5})-[0-9a-f\-]{36}\.metadata\.json$", filename, re.IGNORECASE)
+        if modern:
+            version = str(int(modern.group(1)))  # strip leading zeros
+        else:
+            # Hadoop catalog naming: v3.metadata.json → "3"
+            legacy = re.match(r"^v(\d+)\.metadata\.json$", filename)
+            if legacy:
+                version = legacy.group(1)
+            else:
+                log.warning(
+                    f"Cannot determine sequence number from metadata filename '{filename}'. "
+                    f"version-hint.text will not be written. "
+                    f"If this table is managed by a REST catalog this is expected and harmless."
+                )
+                return
+
         metadata_dir = target_metadata_uri.rsplit("/", 1)[0]
         hint_uri = f"{metadata_dir}/version-hint.text"
-
         self._target.write_text(hint_uri, version)
-        log.info(f"Wrote version-hint.text: {hint_uri} → version {version}")
+        log.info(f"Wrote version-hint.text: {hint_uri} → {version}")
 
 
 def find_latest_metadata(storage: StorageBackend, table_root: str) -> str:
     """
-    Find the latest metadata.json for an Iceberg table by reading
-    version-hint.text or scanning the metadata directory.
+    Find the latest metadata.json for an Iceberg table.
 
-    Args:
-        storage:    StorageBackend to read from.
-        table_root: Table root URI (e.g. s3://warehouse/iceberg/gold/top_customers/)
+    Handles all Iceberg catalog naming conventions:
 
-    Returns:
-        Full URI to the latest metadata.json.
+    1. Hadoop/filesystem catalog (legacy HadoopCatalog):
+         version-hint.text contains "3"  →  v3.metadata.json
+         Fast path — a single read, no directory scan needed.
+
+    2. Modern Iceberg writers (SparkCatalog, REST catalog, Nessie, Polaris,
+       Unity Catalog, AWS Glue, Azure Fabric):
+         00000-550e8400-e29b-41d4-a716-446655440000.metadata.json
+         00001-6ba7b810-9dad-11d1-80b4-00c04fd430c8.metadata.json
+         The 5-digit prefix is the write-sequence counter; the highest wins.
+
+    3. Unrecognised / mixed naming — falls back to reading last-updated-ms
+       from each file to break ties.
+
+    Note: when the source table is managed by a REST catalog the authoritative
+    current-metadata pointer lives in the catalog server, not on disk.  For the
+    highest fidelity, supply metadata_location obtained from the catalog directly
+    and bypass this function entirely.
     """
+    import json
+    import re
+
     metadata_dir = table_root.rstrip("/") + "/metadata/"
 
-    # Try version-hint.text first (fast path)
+    # ── 1. Fast path: Hadoop catalog version-hint.text ───────────────────────
     hint_uri = metadata_dir + "version-hint.text"
     try:
-        version = storage.read_text(hint_uri).strip()
-        metadata_uri = f"{metadata_dir}v{version}.metadata.json"
-        if storage.exists(metadata_uri):
-            return metadata_uri
+        raw = storage.read_text(hint_uri).strip()
+        if raw.isdigit():
+            candidate = f"{metadata_dir}v{raw}.metadata.json"
+            if storage.exists(candidate):
+                log.debug(f"Hadoop catalog: version-hint.text → {candidate}")
+                return candidate
+            log.debug(
+                f"version-hint.text points to missing file {candidate}, "
+                f"falling back to directory scan"
+            )
     except Exception:
-        pass
+        pass  # version-hint.text absent — not a Hadoop catalog table
 
-    # Fallback: scan for the highest-versioned metadata file
-    import re
-    highest_version = -1
-    highest_uri = ""
+    # ── 2. General scan: all .metadata.json files ────────────────────────────
+    all_meta = [
+        fi for fi in storage.list_objects(metadata_dir)
+        if fi.uri.endswith(".metadata.json")
+    ]
 
-    for file_info in storage.list_objects(metadata_dir):
-        match = re.search(r"v(\d+)\.metadata\.json$", file_info.uri)
-        if match:
-            v = int(match.group(1))
-            if v > highest_version:
-                highest_version = v
-                highest_uri = file_info.uri
-
-    if highest_version < 0:
+    if not all_meta:
         raise FileNotFoundError(
             f"No Iceberg metadata found in {metadata_dir}. "
-            f"Is this a valid Iceberg table?"
+            f"Is this a valid Iceberg table root?  "
+            f"If this table is managed by a REST catalog (Nessie, Glue, Polaris, "
+            f"Azure Fabric) supply metadata_location from the catalog directly "
+            f"instead of relying on filesystem discovery."
         )
 
-    return highest_uri
+    # ── 3. Rank by naming-scheme sequence number ──────────────────────────────
+    # Modern:  00003-<uuid>.metadata.json  → seq 3
+    # Legacy:  v3.metadata.json            → seq 3
+    _MODERN = re.compile(
+        r"/(\d{5})-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+        r"\.metadata\.json$",
+        re.IGNORECASE,
+    )
+    _LEGACY = re.compile(r"/v(\d+)\.metadata\.json$")
+
+    def _seq(uri: str) -> int:
+        m = _MODERN.search(uri)
+        if m:
+            return int(m.group(1))
+        m = _LEGACY.search(uri)
+        if m:
+            return int(m.group(1))
+        return -1
+
+    ranked = sorted(all_meta, key=lambda fi: _seq(fi.uri), reverse=True)
+    top_seq = _seq(ranked[0].uri)
+
+    if top_seq < 0:
+        # Unrecognised naming — read last-updated-ms from every file
+        log.warning(
+            f"Metadata files in {metadata_dir} use unrecognised naming "
+            f"(neither v{{N}}.metadata.json nor {{NNNNN}}-{{UUID}}.metadata.json). "
+            f"Reading last-updated-ms from each file to determine the latest."
+        )
+        best_uri, best_ts = "", -1
+        for fi in all_meta:
+            try:
+                ts = json.loads(storage.read_bytes(fi.uri)).get("last-updated-ms", 0)
+                if ts > best_ts:
+                    best_ts, best_uri = ts, fi.uri
+            except Exception:
+                continue
+        if not best_uri:
+            raise FileNotFoundError(f"Could not determine latest metadata in {metadata_dir}")
+        return best_uri
+
+    # Multiple files at the top sequence number (shouldn't happen, but defensive)
+    top_group = [fi for fi in ranked if _seq(fi.uri) == top_seq]
+    if len(top_group) == 1:
+        log.debug(f"Latest metadata (seq={top_seq}): {top_group[0].uri}")
+        return top_group[0].uri
+
+    log.debug(f"{len(top_group)} files at seq={top_seq}, reading last-updated-ms to break tie")
+    best_uri, best_ts = "", -1
+    for fi in top_group:
+        try:
+            ts = json.loads(storage.read_bytes(fi.uri)).get("last-updated-ms", 0)
+            if ts > best_ts:
+                best_ts, best_uri = ts, fi.uri
+        except Exception:
+            continue
+    return best_uri or top_group[0].uri

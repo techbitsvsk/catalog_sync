@@ -6,18 +6,20 @@ These operators wrap CatalogSync for use in Airflow DAGs.  They handle:
 •  XCom push of SyncResult for downstream tasks
 •  Configurable failure behaviour (fail task vs. warn)
 
-Usage in a DAG:
+Operators
+─────────
+IcebergTableSyncOperator       — sync a single table (any source → any target)
+IcebergNamespaceSyncOperator   — sync all tables under a namespace
+IcebergHealthCheckOperator     — verify target metadata is clean (no leaked URIs)
+NessieCatalogRegisterOperator  — register / update a table in a Nessie REST catalog
 
-    from iceberg_sync.airflow.operators import IcebergTableSyncOperator
+Typical DAG pattern (ADLS → MinIO → Nessie):
 
-    sync_gold = IcebergTableSyncOperator(
-        task_id="sync_gold_revenue",
-        source_root="s3://warehouse/iceberg/",
-        target_root="abfss://iceberg@account.dfs.core.windows.net/iceberg/",
-        table="gold/revenue_by_order_date",
-        source_storage_kwargs={"region_name": "eu-west-2"},
-        target_storage_kwargs={"storage_account_name": "sticebergpipeline"},
-    )
+    sync  = IcebergTableSyncOperator(task_id="sync", ...)
+    check = IcebergHealthCheckOperator(task_id="check", ...)
+    reg   = NessieCatalogRegisterOperator(task_id="register_nessie", ...)
+
+    sync >> check >> reg
 """
 
 from __future__ import annotations
@@ -96,6 +98,7 @@ class IcebergTableSyncOperator(BaseOperator):
             "files_skipped": result.files_skipped,
             "bytes_copied": result.bytes_copied,
             "duration_seconds": result.duration_seconds,
+            "target_metadata_uri": result.target_metadata_uri,
             "paths_translated": (
                 result.rewrite_stats.data_file_paths_translated
                 if result.rewrite_stats else 0
@@ -248,3 +251,114 @@ class IcebergHealthCheckOperator(BaseOperator):
         })
 
         return True
+
+
+class NessieCatalogRegisterOperator(BaseOperator):
+    """
+    Register or update an Iceberg table in a Nessie REST catalog.
+
+    Run this after IcebergTableSyncOperator to make the synced table
+    immediately queryable via any Iceberg REST catalog client (Spark,
+    Trino, PyIceberg, DuckDB).
+
+    The metadata_location is taken from XCom of the upstream sync task
+    by default.  Override with a literal string if needed.
+
+    Args:
+        nessie_uri:         Nessie base URL (e.g. http://nessie:19120)
+        namespace:          Catalog namespace (e.g. "gold")
+        table:              Table name (e.g. "top_customers")
+        nessie_ref:         Branch to commit to (default: "main")
+        nessie_token:       Bearer token for secured Nessie deployments
+        metadata_location:  Explicit metadata URI.  If None, reads from
+                            XCom key 'target_metadata_uri' of the upstream
+                            sync task (task_id passed via sync_task_id).
+        sync_task_id:       task_id of the upstream IcebergTableSyncOperator
+                            used to pull metadata_location from XCom.
+
+    XCom output (key: 'nessie_result'):
+        {"namespace": ..., "table": ..., "metadata_location": ..., "action": "registered"|"updated"|"skipped"}
+    """
+
+    template_fields = ("nessie_uri", "namespace", "table", "metadata_location")
+
+    def __init__(
+        self,
+        *,
+        nessie_uri: str,
+        namespace: str,
+        table: str,
+        nessie_ref: str = "main",
+        nessie_token: Optional[str] = None,
+        metadata_location: Optional[str] = None,
+        sync_task_id: Optional[str] = None,
+        fail_on_error: bool = True,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.nessie_uri = nessie_uri
+        self.namespace = namespace
+        self.table = table
+        self.nessie_ref = nessie_ref
+        self.nessie_token = nessie_token
+        self.metadata_location = metadata_location
+        self.sync_task_id = sync_task_id
+        self.fail_on_error = fail_on_error
+
+    def execute(self, context):
+        from iceberg_sync.catalog.nessie import NessieCatalog
+
+        # Resolve metadata_location: explicit value, or pull from upstream XCom
+        metadata_loc = self.metadata_location
+        if not metadata_loc and self.sync_task_id:
+            sync_result = context["ti"].xcom_pull(
+                task_ids=self.sync_task_id, key="sync_result"
+            )
+            if sync_result:
+                metadata_loc = sync_result.get("target_metadata_uri")
+
+        if not metadata_loc:
+            msg = (
+                "NessieCatalogRegisterOperator: could not determine metadata_location. "
+                "Either set metadata_location directly or set sync_task_id to pull "
+                "it from an upstream IcebergTableSyncOperator."
+            )
+            if self.fail_on_error:
+                raise ValueError(msg)
+            log.warning(msg)
+            return None
+
+        nessie = NessieCatalog(
+            uri=self.nessie_uri,
+            ref=self.nessie_ref,
+            token=self.nessie_token,
+        )
+
+        if not nessie.ping():
+            msg = f"Cannot reach Nessie at {self.nessie_uri}"
+            if self.fail_on_error:
+                raise RuntimeError(msg)
+            log.warning(msg)
+            return None
+
+        log.info(f"Registering {self.namespace}.{self.table} → {metadata_loc}")
+        result = nessie.register_or_update(
+            namespace=self.namespace,
+            table=self.table,
+            metadata_location=metadata_loc,
+        )
+
+        action = "skipped" if result.get("skipped") else (
+            "updated" if nessie.table_exists(self.namespace, self.table) else "registered"
+        )
+
+        summary = {
+            "namespace": self.namespace,
+            "table": self.table,
+            "metadata_location": metadata_loc,
+            "nessie_uri": self.nessie_uri,
+            "action": action,
+        }
+        context["ti"].xcom_push(key="nessie_result", value=summary)
+        log.info(f"Nessie {action}: {self.namespace}.{self.table}")
+        return summary
