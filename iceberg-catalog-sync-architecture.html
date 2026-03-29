@@ -77,7 +77,7 @@ flowchart LR
         e4["④ Rewrite Metadata\nPathTranslator  abfss→s3a\nfastavro Avro rewrite"]
         e5["⑤ Atomic Commit\nversion-hint.text  (Hadoop catalog only)\nSkipped for REST catalog targets\n(Nessie is the authoritative pointer)"]
         e6["⑥ Health Check\nno leaked abfss:// URIs"]
-        e7["⑦ Register Catalog\nNessieCatalog.register_or_update()\nPOST /iceberg/v1/namespaces/gold/register"]
+        e7["⑦ Register Catalog\nNessieCatalog.register_or_update()\nPOST /api/v2/trees/main@{hash}/history/commit"]
         e1 --> e2 --> e3 --> e4 --> e5 --> e6 --> e7
     end
 
@@ -223,19 +223,19 @@ sequenceDiagram
     Note over AF,NS: Phase 6 — Catalog Registration (NessieCatalogRegisterOperator)
     AF->>AF: xcom_pull(sync_result.target_metadata_uri)
     Note over AF: s3a://warehouse/gold/top_customers/metadata/v3.metadata.json
-    AF->>NS: GET /iceberg/v1/namespaces/gold/tables/top_customers
+    AF->>NS: GET /api/v2/trees/main/contents/gold.top_customers
     alt First sync — table not registered
         NS-->>AF: 404 Not Found
-        AF->>NS: POST /iceberg/v1/namespaces<br/>{namespace: ["gold"]}
+        AF->>NS: POST /api/v2/trees/main@{hash}/history/commit<br/>{PUT NAMESPACE gold}
         NS-->>AF: 200 OK — namespace created
-        AF->>NS: POST /iceberg/v1/namespaces/gold/register<br/>{name: top_customers, metadata-location: s3a://...v3.metadata.json}
+        AF->>NS: POST /api/v2/trees/main@{hash}/history/commit<br/>{PUT ICEBERG_TABLE gold.top_customers → s3a://...v3.metadata.json}
         NS-->>AF: 200 OK — table registered
     else Incremental — update to new metadata
         NS-->>AF: 200 OK — current metadata-location: s3a://...v2.metadata.json
         Note over AF: Pre-capture current pointer for restore safety
-        AF->>NS: DELETE /iceberg/v1/namespaces/gold/tables/top_customers
+        AF->>NS: POST /api/v2/trees/main@{hash}/history/commit<br/>{DELETE gold.top_customers}
         NS-->>AF: 204 No Content
-        AF->>NS: POST /iceberg/v1/namespaces/gold/register<br/>{name: top_customers, metadata-location: s3a://...v3.metadata.json}
+        AF->>NS: POST /api/v2/trees/main@{hash}/history/commit<br/>{PUT ICEBERG_TABLE gold.top_customers → s3a://...v3.metadata.json}
         NS-->>AF: 200 OK — table updated
         Note over AF: On failure: restore s3a://...v2.metadata.json automatically<br/>Log CRITICAL + manual recovery command if restore also fails
     end
@@ -328,7 +328,7 @@ flowchart LR
     S3 --> TD
     S4 --> TM
     S5 -->|"files readable"| Target
-    S6 -->|"POST /iceberg/v1/\nnamespaces/gold/register"| Nessie
+    S6 -->|"POST /api/v2/trees/main@{hash}/\nhistory/commit"| Nessie
 
     style CatalogSync fill:#0d1117,stroke:#58a6ff,color:#c9d1d9
     style Source fill:#1a1e2e,stroke:#58a6ff,color:#c9d1d9
@@ -367,7 +367,7 @@ flowchart TB
     end
 
     VH["version-hint.text  (Hadoop catalog only)\nwrite_version_hint=True → writes sequence number\nwrite_version_hint=False → skipped\n(REST catalog / Nessie targets)"]
-    NC2["Nessie catalog entry  (REST catalog)\ngold.top_customers\nmetadata-location: s3a://.../00003-ghi.metadata.json\nPOST /iceberg/v1/namespaces/gold/register"]
+    NC2["Nessie catalog entry  (REST catalog)\ngold.top_customers\nmetadata-location: s3a://.../00003-ghi.metadata.json\nPOST /api/v2/trees/main@{hash}/history/commit"]
 
     Source --> PT --> Target
     Target -.->|"Hadoop catalog only"| VH
@@ -413,11 +413,11 @@ flowchart TB
     end
 
     subgraph Catalog["catalog/ — REST catalog layer"]
-        NC["nessie.py\nNessieCatalog\nregister_or_update()\nregister_table()  POST /iceberg/v1/.../register\nupdate_table()    DROP + re-register\nping()  list_tables()"]
+        NC["nessie.py\nNessieCatalog\nregister_or_update()\nregister_table()  POST /api/v2/trees/{ref}@{hash}/history/commit\nupdate_table()    DROP + re-register\nping()  list_tables()"]
     end
 
     subgraph NessieServer["Nessie REST Server"]
-        NR["POST /iceberg/v1/namespaces/{ns}/register\nGET  /iceberg/v1/namespaces/{ns}/tables/{t}\nDEL  /iceberg/v1/namespaces/{ns}/tables/{t}"]
+        NR["POST /api/v2/trees/{ref}@{hash}/history/commit  (PUT ICEBERG_TABLE)\nGET  /api/v2/trees/{ref}/contents/{ns}.{t}\nDEL  /api/v2/trees/{ref}@{hash}/history/commit  (DELETE key)"]
     end
 
     CLI --> CS
@@ -496,7 +496,7 @@ flowchart LR
     end
 
     AS -->|"IcebergTableSyncOperator\ncopies Parquet + rewrites metadata"| MI
-    AS -->|"NessieCatalogRegisterOperator\nPOST /iceberg/v1/namespaces/.../register"| N
+    AS -->|"NessieCatalogRegisterOperator\nPOST /api/v2/trees/main@{hash}/history/commit"| N
     ADLS2 -->|"source\n(read only)"| AS
     N -->|"REST catalog\nload_table() / SELECT"| clients
     MI -->|"s3a:// files\nParquet + Avro"| clients
@@ -690,16 +690,16 @@ sequenceDiagram
     Note over T: MinIO table is self-consistent<br/>Nessie registration is the authoritative pointer
     end
 
-    CS->>N: GET /iceberg/v1/namespaces/gold/tables/top_customers
+    CS->>N: GET /api/v2/trees/main/contents/gold.top_customers
     Note over CS: Pre-capture current metadata-location for restore safety
     alt first sync — table not registered
         N-->>CS: 404 Not Found
-        CS->>N: POST /iceberg/v1/namespaces/gold/register
+        CS->>N: POST /api/v2/trees/main@{hash}/history/commit (PUT ICEBERG_TABLE)
         N-->>CS: 200 OK — registered
     else incremental — update pointer
         N-->>CS: 200 OK — previous pointer captured
-        CS->>N: DELETE /iceberg/v1/namespaces/gold/tables/top_customers
-        CS->>N: POST /iceberg/v1/namespaces/gold/register new pointer
+        CS->>N: POST /api/v2/trees/main@{hash}/history/commit (DELETE gold.top_customers)
+        CS->>N: POST /api/v2/trees/main@{hash}/history/commit (PUT ICEBERG_TABLE new pointer)
         N-->>CS: 200 OK — updated
         Note over CS: On failure: restore previous pointer automatically<br/>Log CRITICAL + manual recovery if restore also fails
     end
@@ -911,7 +911,7 @@ flowchart LR
         E1A["\u2460 Discover + Diff\nfilesystem scan or Glue REST endpoint\nread_snapshot_data_files() manifest walk"]
         E1B["\u2461 Copy  new Parquet only\ns3:// read  s3a:// write \u2014 parallel"]
         E1C["\u2462 Rewrite  PathTranslator\ns3://my-warehouse \u2192 s3a://warehouse"]
-        E1D["\u2463 Register  NessieCatalog\nPOST /iceberg/v1/namespaces/gold/register"]
+        E1D["\u2463 Register  NessieCatalog\nPOST /api/v2/trees/main@{hash}/history/commit"]
         E1A --> E1B --> E1C --> E1D
     end
 

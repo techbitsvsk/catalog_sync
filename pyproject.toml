@@ -27,6 +27,7 @@ airflow = ["apache-airflow>=2.7"]
 nessie = ["requests>=2.31"]
 auth = ["requests>=2.31", "pyjwt>=2.8"]
 spark = ["pyspark>=3.5", "requests>=2.31"]
+datahub = ["acryl-datahub>=0.12"]
 dev = ["pytest>=7.0", "pytest-cov", "moto[s3]>=5.0", "ruff>=0.4", "requests>=2.31"]
 
 [project.scripts]

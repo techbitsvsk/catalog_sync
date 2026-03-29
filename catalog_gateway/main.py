@@ -11,7 +11,7 @@ Enforcement model
   Layer 3  Column masking    Stored as table property; query engine applies it    (advisory)
 
 Clients connect to:  http://catalog-gateway:8083  (Iceberg REST Catalog v1)
-Backend (Nessie):    http://nessie:19120/iceberg/v1
+Backend (Nessie):    http://nessie:19120
 
 Authentication
 ──────────────
@@ -25,6 +25,7 @@ gateway is the sole entry point.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -40,10 +41,13 @@ from policy import JWTError, PolicyDecision, get_policy, validate_token
 
 log = logging.getLogger("catalog_gateway")
 
-NESSIE_URL   = os.getenv("NESSIE_URL",            "http://nessie:19120/iceberg/v1")
-OAUTH_URL    = os.getenv("OAUTH_URL",             "http://oauth-service:8081")
-GW_CLIENT_ID = os.getenv("GATEWAY_CLIENT_ID",     "admin-client")
-GW_SECRET    = os.getenv("GATEWAY_CLIENT_SECRET", "admin-secret")
+NESSIE_URL    = os.getenv("NESSIE_URL",            "http://nessie:19120")
+OAUTH_URL     = os.getenv("OAUTH_URL",             "http://oauth-service:8081")
+GW_CLIENT_ID  = os.getenv("GATEWAY_CLIENT_ID",     "admin-client")
+GW_SECRET     = os.getenv("GATEWAY_CLIENT_SECRET", "admin-secret")
+S3_ENDPOINT   = os.getenv("S3_ENDPOINT",           "http://minio:9000")
+S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY",         "minioadmin")
+S3_SECRET_KEY = os.getenv("S3_SECRET_KEY",         "minioadmin")
 
 # Matches: v1[/ref]/namespaces/<ns>/tables/<tbl>[/suffix]
 _TABLE_RE = re.compile(
@@ -94,6 +98,118 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Catalog Gateway", version="1.0.0", lifespan=lifespan)
 
 
+# ── Server-side scan planning (PyIceberg) ────────────────────────────────────
+
+def _pyiceberg_plan_scan(
+    metadata_location: str,
+    row_filter_sql: str | None,
+    excluded_cols: list[str],
+    select: list[str] | None,
+) -> dict:
+    """
+    Use PyIceberg to plan a table scan with the security row/column filters.
+
+    Runs synchronously — always call via asyncio.get_event_loop().run_in_executor()
+    so it doesn't block the async event loop.
+
+    Returns a dict matching the Iceberg REST ScanTableResponse schema:
+      { "file-scan-tasks": [ { "data-file": {...}, "delete-files": [] }, ... ] }
+    """
+    from pyiceberg.expressions import AlwaysTrue, EqualTo, In
+    from pyiceberg.table import StaticTable
+
+    # Normalise s3a:// → s3:// — PyIceberg S3FileIO uses the s3:// scheme.
+    loc = metadata_location.replace("s3a://", "s3://")
+
+    props = {
+        "s3.endpoint":          S3_ENDPOINT,
+        "s3.access-key-id":     S3_ACCESS_KEY,
+        "s3.secret-access-key": S3_SECRET_KEY,
+        "s3.path-style-access": "true",
+        "s3.region":            "us-east-1",
+    }
+    table = StaticTable.from_metadata(loc, properties=props)
+
+    # Build row-filter expression from the OPA SQL predicate.
+    row_filter = AlwaysTrue()
+    if row_filter_sql:
+        s = row_filter_sql.strip()
+        m = re.match(r"^(\w+)\s*=\s*'([^']*)'$", s)
+        if m:
+            row_filter = EqualTo(m.group(1), m.group(2))
+        else:
+            m = re.match(r"^(\w+)\s+IN\s*\(([^)]+)\)$", s, re.I)
+            if m:
+                vals = [v.strip().strip("'\"") for v in m.group(2).split(",")]
+                row_filter = In(m.group(1), vals)
+            else:
+                log.warning("Cannot parse row_filter for scan planning: %r", row_filter_sql)
+
+    # Column projection (client selection ∩ security exclusions removed).
+    exc = set(excluded_cols or [])
+    selected: tuple[str, ...] | None = None
+    if select:
+        selected = tuple(c for c in select if c not in exc)
+
+    scan = table.scan(row_filter=row_filter, selected_fields=selected or ())
+    tasks = list(scan.plan_files())
+
+    # Map PyIceberg partition spec → column names for the REST response.
+    spec   = table.spec()
+    schema = table.schema()
+    partition_col_names = [
+        schema.find_column_name(f.source_id) for f in spec.fields
+    ]
+
+    file_scan_tasks = []
+    for task in tasks:
+        df = task.file
+        partition: dict = {}
+        for i, col in enumerate(partition_col_names):
+            try:
+                val = df.partition[i]
+                if val is not None:
+                    partition[col] = val
+            except Exception:
+                pass
+
+        # content: 0=DATA, 1=POSITION_DELETES, 2=EQUALITY_DELETES
+        content_val = df.content.value if hasattr(df.content, "value") else 0
+        fmt_val     = df.file_format.value if hasattr(df.file_format, "value") else "PARQUET"
+        file_scan_tasks.append({
+            "data-file": {
+                "spec-id":            df.spec_id or 0,
+                "content":            content_val,
+                "file-path":          df.file_path,
+                "file-format":        fmt_val,
+                "partition":          partition,
+                "record-count":       df.record_count,
+                "file-size-in-bytes": df.file_size_in_bytes,
+            },
+            "delete-files": [],
+        })
+
+    return {"file-scan-tasks": file_scan_tasks}
+
+
+async def _plan_scan(
+    metadata_location: str,
+    row_filter_sql: str | None,
+    excluded_cols: list[str],
+    select: list[str] | None,
+) -> dict:
+    """Async wrapper: runs PyIceberg scan planning in a thread-pool executor."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        _pyiceberg_plan_scan,
+        metadata_location,
+        row_filter_sql,
+        excluded_cols,
+        select,
+    )
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 async def _extract_principal(request: Request) -> str:
@@ -112,9 +228,12 @@ async def _nessie(app_state, method: str, path: str, *,
                   params: dict | None = None) -> httpx.Response:
     """Forward a request to Nessie using the gateway's admin token."""
     token = await _tokens.get()
+    rel = path.lstrip("/")
+    # Iceberg REST paths (v1/...) are served under /iceberg/ on Nessie
+    nessie_path = f"/iceberg/{rel}" if rel.startswith("v1") else f"/{rel}"
     return await app_state.nessie.request(
         method,
-        f"/{path.lstrip('/')}",
+        nessie_path,
         content=body,
         params=params,
         headers={
@@ -201,13 +320,34 @@ async def gateway(request: Request, path: str):
     """
     # ── Unauthenticated pass-through ─────────────────────────────────────────
     if path in ("health",) or path.startswith(("v1/config", "q/")):
+        # For /v1/config: drop the warehouse query param before forwarding.
+        # When Spark sends warehouse=s3a://warehouse/, Nessie returns a prefix
+        # like "main|s3a://warehouse/" which the Iceberg Java client embeds
+        # verbatim into subsequent URI paths — the s3a:// double-slash makes
+        # Java's URI.create() fail.  Without the warehouse param Nessie returns
+        # prefix="main" (clean, no scheme), which works correctly.
+        # The warehouse location is still communicated via defaults.warehouse.
+        fwd_params = dict(request.query_params)
+        if path.startswith("v1/config"):
+            fwd_params.pop("warehouse", None)
         r = await _nessie(
             request.app.state,
             request.method,
             path,
             body=await request.body() or None,
-            params=dict(request.query_params),
+            params=fwd_params,
         )
+        # Rewrite Nessie's /v1/config response: strip URI overrides that point
+        # to Nessie's internal address (nessie:19120).  Without this, the Iceberg
+        # client would bypass the gateway and connect to Nessie directly — which
+        # is unreachable from outside Docker and skips all enforcement.
+        if path.startswith("v1/config") and r.status_code == 200:
+            cfg = r.json()
+            for key in ("uri", "nessie.core-base-uri", "nessie.catalog-base-uri",
+                        "nessie.iceberg-base-uri"):
+                cfg.get("overrides", {}).pop(key, None)
+            cfg.get("overrides", {}).pop("nessie.prefix-pattern", None)
+            return JSONResponse(cfg)
         return _resp(r)
 
     # ── All other paths require authentication ────────────────────────────────
@@ -236,13 +376,33 @@ async def gateway(request: Request, path: str):
             raise HTTPException(
                 403, f"Principal '{principal}' denied READ on {namespace}.{table}"
             )
-        r = await _nessie(request.app.state, "GET", path)
-        if r.status_code != 200 or not dec.excluded_columns:
+        r = await _nessie(request.app.state, "GET", path,
+                          params=dict(request.query_params))
+        if r.status_code != 200:
             return _resp(r)
 
-        # Layer 4 — remove excluded columns from schema (hard CLS)
         meta = r.json()
-        _strip_columns(meta, set(dec.excluded_columns))
+
+        # Strip S3V4RestSigner vended credentials: Nessie returns a signer URI
+        # pointing to its internal address (nessie:19120) which is unreachable
+        # from external clients.  Removing these keys forces S3FileIO to fall
+        # back to HadoopFileIO via the Spark S3A configuration (fs.s3a.*).
+        _SIGNER_KEYS = {
+            "s3.signer", "s3.signer.uri", "s3.signer.endpoint",
+            "s3.remote-signing-enabled", "s3.endpoint",
+            "io-impl", "py-io-impl",
+        }
+        cfg = meta.get("config", {})
+        for k in _SIGNER_KEYS:
+            cfg.pop(k, None)
+        # Force HadoopFileIO so Spark resolves s3a:// via its own fs.s3a.* config.
+        cfg["io-impl"] = "org.apache.iceberg.hadoop.HadoopFileIO"
+        if cfg is not meta.get("config"):   # ensure the key exists if config was absent
+            meta["config"] = cfg
+
+        # Layer 4 — remove excluded columns from schema (hard CLS)
+        if dec.excluded_columns:
+            _strip_columns(meta, set(dec.excluded_columns))
 
         # Layer 3 — store masks as table property (advisory; engine applies)
         if dec.column_masks:

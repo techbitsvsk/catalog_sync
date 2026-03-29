@@ -2,3 +2,4 @@ fastapi>=0.115
 uvicorn[standard]>=0.32
 httpx>=0.28
 pyjwt[crypto]>=2.9
+pyiceberg[s3fs]>=0.7.0

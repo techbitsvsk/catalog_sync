@@ -77,3 +77,4 @@ version-hint.text
 
 # Packaging
 MANIFEST
+.claude/settings.json

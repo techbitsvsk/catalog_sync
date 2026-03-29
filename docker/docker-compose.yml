@@ -94,7 +94,7 @@ services:
   # OPA is NOT exposed on a host port in production — only catalog-gateway
   # talks to it internally. The 8181 host port is for local policy development.
   opa:
-    image: openpolicyagent/opa:latest-rootless
+    image: openpolicyagent/opa:latest
     container_name: opa
     ports:
       - "8181:8181"
@@ -106,10 +106,10 @@ services:
       - --addr
       - 0.0.0.0:8181
       - --log-level
-      - warn
+      - error
       - /policies
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8181/health"]
+      test: ["CMD", "/opa", "check", "/policies/iceberg.rego"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -125,18 +125,23 @@ services:
     ports:
       - "8083:8083"
     environment:
-      NESSIE_URL: http://nessie:19120/iceberg/v1
+      NESSIE_URL: http://nessie:19120
       OPA_URL: http://opa:8181
       OAUTH_URL: http://oauth-service:8081
       JWKS_URI: http://oauth-service:8081/.well-known/jwks.json
       GATEWAY_CLIENT_ID: admin-client
       GATEWAY_CLIENT_SECRET: admin-secret
       ISSUER: http://oauth-service:8081
+      # S3 credentials used by the gateway for server-side scan planning
+      # (reading Iceberg manifests to enforce row-level security via /scan).
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
     depends_on:
       nessie:
         condition: service_healthy
       opa:
-        condition: service_healthy
+        condition: service_started
       oauth-service:
         condition: service_healthy
     healthcheck:
@@ -152,7 +157,7 @@ services:
   # NOTE: No host port binding — accessible only from within iceberg-net.
   # All client access must go through catalog-gateway:8083.
   nessie:
-    image: projectnessie/nessie:latest
+    image: ghcr.io/projectnessie/nessie:latest
     container_name: nessie
     # Port 19120 is intentionally NOT exposed to the host.
     # Clients must use catalog-gateway:8083 (enforcement point).
@@ -173,13 +178,34 @@ services:
       QUARKUS_OIDC_TOKEN_ISSUER: http://oauth-service:8081
       QUARKUS_LOG_LEVEL: WARN
       QUARKUS_HTTP_PORT: 19120
+      # Allow unauthenticated access to Quarkus management/health endpoints
+      QUARKUS_HTTP_AUTH_PERMISSION_HEALTH_PATHS: /q/*
+      QUARKUS_HTTP_AUTH_PERMISSION_HEALTH_POLICY: permit
+      # Iceberg REST Catalog — served at /iceberg/v1/ (requires catalog to be enabled)
+      NESSIE_CATALOG_ENABLED: "true"
+      NESSIE_CATALOG_DEFAULT_WAREHOUSE: minio
+      NESSIE_CATALOG_WAREHOUSES_MINIO_LOCATION: s3a://warehouse/
+      # MinIO / S3-compatible backend for catalog storage
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT: http://minio:9000
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REGION: us-east-1
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_PATH_STYLE_ACCESS: "true"
+      # APPLICATION_GLOBAL: Nessie uses AWS SDK default credential chain
+      # (picks up AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY below) for its
+      # own S3 access (reading/validating manifest files on snapshot commit).
+      # Client-side S3 access is handled separately: the catalog-gateway
+      # strips the S3V4RestSigner from vended credentials and injects
+      # HadoopFileIO so Spark goes to MinIO directly via fs.s3a.*.
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_AUTH_TYPE: APPLICATION_GLOBAL
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
     depends_on:
       postgres:
         condition: service_healthy
       oauth-service:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:19120/q/health/ready || exit 1"]
+      # curl without -f: exits 0 for any HTTP response including 401 (server is up)
+      test: ["CMD-SHELL", "curl -s http://localhost:19120/q/health/ready > /dev/null"]
       interval: 15s
       timeout: 10s
       retries: 12

@@ -253,6 +253,178 @@ class IcebergHealthCheckOperator(BaseOperator):
         return True
 
 
+class DatahubEmitterOperator(BaseOperator):
+    """
+    Emit synced Iceberg table metadata to DataHub GMS.
+
+    Designed to run after NessieCatalogRegisterOperator in a DAG chain:
+
+        sync >> health_check >> nessie_register >> datahub_emit
+
+    Reads the sync result from XCom (via sync_task_id) to obtain:
+      •  target_metadata_uri  — used as the metadata_location in DataHub
+      •  source_metadata_uri  — used to build the upstream lineage edge
+      •  files_copied / bytes_copied / duration_seconds — emitted as custom properties
+
+    Schema is read directly from target storage so DataHub receives the full
+    unmasked schema regardless of any catalog-gateway OPA column exclusions.
+
+    Args:
+        gms_server:           DataHub GMS URL (e.g. http://datahub-gms:8080).
+        namespace:            Iceberg namespace (e.g. "gold").
+        table:                Table name (e.g. "top_customers").
+        sync_task_id:         task_id of the upstream IcebergTableSyncOperator.
+                              Used to pull metadata URIs and counters from XCom.
+        datahub_token:        Personal Access Token for authenticated DataHub.
+        env:                  DataHub environment (PROD / DEV / STAGING).
+        source_platform:      DataHub platform name for source URN.
+        target_platform:      DataHub platform name for target URN.
+        target_storage_kwargs: Kwargs forwarded to create_storage() for reading
+                              the target metadata.json to extract the schema.
+                              If omitted, schema emission is skipped.
+        extra_properties:     Additional custom properties for DatasetProperties.
+        fail_on_error:        If True, task fails when DataHub is unreachable.
+                              Defaults to False — DataHub issues should not
+                              block the sync pipeline.
+
+    XCom output (key: 'datahub_result'):
+        {
+            "dataset_urn": "urn:li:dataset:(...)",
+            "namespace":   "gold",
+            "table":       "top_customers",
+            "emitted":     True,
+        }
+    """
+
+    template_fields = ("gms_server", "namespace", "table")
+
+    def __init__(
+        self,
+        *,
+        gms_server: str,
+        namespace: str,
+        table: str,
+        sync_task_id: str,
+        datahub_token: Optional[str] = None,
+        env: str = "PROD",
+        source_platform: str = "iceberg",
+        target_platform: str = "iceberg",
+        target_storage_kwargs: Optional[Dict[str, Any]] = None,
+        extra_properties: Optional[Dict[str, str]] = None,
+        fail_on_error: bool = False,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.gms_server = gms_server
+        self.namespace = namespace
+        self.table = table
+        self.sync_task_id = sync_task_id
+        self.datahub_token = datahub_token
+        self.env = env
+        self.source_platform = source_platform
+        self.target_platform = target_platform
+        self.target_storage_kwargs = target_storage_kwargs or {}
+        self.extra_properties = extra_properties or {}
+        self.fail_on_error = fail_on_error
+
+    def execute(self, context):
+        from iceberg_sync.catalog.datahub import DatahubCatalog, _build_dataset_urn
+
+        # ── Pull sync result from upstream XCom ──────────────────────────────
+        sync_result = context["ti"].xcom_pull(
+            task_ids=self.sync_task_id, key="sync_result"
+        )
+        if not sync_result:
+            msg = (
+                f"DatahubEmitterOperator: no sync_result XCom from task '{self.sync_task_id}'. "
+                "Ensure IcebergTableSyncOperator runs upstream and succeeds."
+            )
+            if self.fail_on_error:
+                raise ValueError(msg)
+            log.warning(msg)
+            return None
+
+        if not sync_result.get("success"):
+            log.warning(
+                f"Upstream sync for {self.namespace}.{self.table} was not successful "
+                "— skipping DataHub emit."
+            )
+            return None
+
+        target_metadata_uri: str = sync_result.get("target_metadata_uri", "")
+        source_metadata_uri: str = sync_result.get("source_metadata_uri", "")
+
+        # ── Optionally read target metadata.json for schema emission ─────────
+        target_metadata = None
+        if self.target_storage_kwargs and target_metadata_uri:
+            try:
+                import json
+                from iceberg_sync.storage import create_storage
+                target_storage = create_storage(
+                    target_metadata_uri, **self.target_storage_kwargs
+                )
+                raw = target_storage.read_bytes(target_metadata_uri)
+                target_metadata = json.loads(raw)
+                log.info(
+                    f"Read target metadata for schema: "
+                    f"{len(target_metadata.get('schemas', []))} schema(s)"
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    f"Could not read target metadata for schema emission "
+                    f"({target_metadata_uri}): {e}"
+                )
+
+        # ── Build extra properties from sync counters ─────────────────────────
+        props = {
+            "files_copied":           str(sync_result.get("files_copied", 0)),
+            "files_skipped":          str(sync_result.get("files_skipped", 0)),
+            "bytes_copied":           str(sync_result.get("bytes_copied", 0)),
+            "sync_duration_seconds":  str(sync_result.get("duration_seconds", 0)),
+            "paths_translated":       str(sync_result.get("paths_translated", 0)),
+            **self.extra_properties,
+        }
+
+        # ── Emit ──────────────────────────────────────────────────────────────
+        dh = DatahubCatalog(
+            gms_server=self.gms_server,
+            token=self.datahub_token,
+            env=self.env,
+            source_platform=self.source_platform,
+            target_platform=self.target_platform,
+            fail_silently=not self.fail_on_error,
+        )
+
+        if not dh.test_connection():
+            msg = f"DataHub GMS unreachable at {self.gms_server}"
+            if self.fail_on_error:
+                raise RuntimeError(msg)
+            log.warning(msg)
+            return None
+
+        emitted = dh.emit_table(
+            namespace=self.namespace,
+            table=self.table,
+            metadata_location=target_metadata_uri,
+            target_metadata=target_metadata,
+            source_metadata_location=source_metadata_uri or None,
+            extra_properties=props,
+        )
+
+        target_urn = _build_dataset_urn(
+            self.target_platform, self.namespace, self.table, self.env
+        )
+        summary = {
+            "dataset_urn": target_urn,
+            "namespace":   self.namespace,
+            "table":       self.table,
+            "emitted":     emitted,
+        }
+        context["ti"].xcom_push(key="datahub_result", value=summary)
+        log.info(f"DataHub emit {'succeeded' if emitted else 'failed'}: {target_urn}")
+        return summary
+
+
 class NessieCatalogRegisterOperator(BaseOperator):
     """
     Register or update an Iceberg table in a Nessie REST catalog.

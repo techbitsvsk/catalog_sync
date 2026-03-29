@@ -54,22 +54,26 @@ OAUTH_URL   = "http://localhost:8081"
 MINIO_URL   = "http://localhost:9000"
 WAREHOUSE   = "s3a://warehouse/"
 
-# Named catalogs: catalog_name → (client_id, client_secret)
+# Named catalogs: catalog_name → (client_id, client_secret, scope)
+# Scope must match what the OAuth service has granted to each client.
+# Iceberg REST Catalog defaults to "catalog" which the OAuth service rejects.
 CATALOGS = {
-    "gw_admin":     ("admin-client",     "admin-secret"),
-    "gw_analytics": ("analytics-client", "analytics-secret"),
-    "gw_ds":        ("data-scientist",   "ds-secret"),
+    "gw_admin":     ("admin-client",     "admin-secret",     "catalog:read catalog:write catalog:admin catalog:drop"),
+    "gw_analytics": ("analytics-client", "analytics-secret", "catalog:read"),
+    "gw_ds":        ("data-scientist",   "ds-secret",        "catalog:read"),
 }
 
 
 # ── Spark catalog config ──────────────────────────────────────────────────────
 
-def _catalog_configs(name: str, client_id: str, client_secret: str) -> dict:
+def _catalog_configs(name: str, client_id: str, client_secret: str, scope: str) -> dict:
     """
     Iceberg RESTCatalog config for one principal.
 
     credential = client_id:client_secret  — triggers client_credentials grant.
     oauth2-server-uri — token endpoint (RESTCatalog fetches + caches tokens).
+    scope — must match the OAuth service's allowed scopes; Iceberg defaults to
+            "catalog" which this service does not accept.
     No Nessie-specific extensions or JARs needed; pure Iceberg REST protocol.
     """
     p = f"spark.sql.catalog.{name}"
@@ -79,6 +83,7 @@ def _catalog_configs(name: str, client_id: str, client_secret: str) -> dict:
         f"{p}.uri":                GATEWAY_URL,
         f"{p}.credential":         f"{client_id}:{client_secret}",
         f"{p}.oauth2-server-uri":  f"{OAUTH_URL}/token",
+        f"{p}.scope":              scope,
         f"{p}.warehouse":          WAREHOUSE,
     }
 
@@ -94,6 +99,7 @@ def build_spark() -> SparkSession:
     """
     packages = ",".join([
         "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.9.1",
+        "org.apache.iceberg:iceberg-aws-bundle:1.9.1",
         "org.apache.hadoop:hadoop-aws:3.3.4",
         "com.amazonaws:aws-java-sdk-bundle:1.12.262",
     ])
@@ -113,10 +119,13 @@ def build_spark() -> SparkSession:
                 "org.apache.hadoop.fs.s3a.S3AFileSystem")
         .config("spark.hadoop.fs.s3a.aws.credentials.provider",
                 "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")
+        # Use in-memory upload buffer — avoids needing a /tmp/hadoop-*/s3a
+        # temp directory (which may not exist on Windows).
+        .config("spark.hadoop.fs.s3a.fast.upload.buffer", "array")
     )
 
-    for catalog_name, (client_id, client_secret) in CATALOGS.items():
-        for key, value in _catalog_configs(catalog_name, client_id, client_secret).items():
+    for catalog_name, (client_id, client_secret, scope) in CATALOGS.items():
+        for key, value in _catalog_configs(catalog_name, client_id, client_secret, scope).items():
             builder = builder.config(key, value)
 
     return builder.getOrCreate()
@@ -177,7 +186,7 @@ def read_via_gateway(spark: SparkSession, catalog_name: str) -> None:
       - Row filter injected into Iceberg scan expression (RLS)
       - Excluded columns stripped from table schema before Spark sees it (CLS)
     """
-    print(f"\n{'─'*60}")
+    print(f"\n{'-'*60}")
     print(f"Catalog: {catalog_name}")
     try:
         df = spark.table(f"{catalog_name}.gold.orders")
