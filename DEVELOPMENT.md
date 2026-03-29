@@ -113,8 +113,10 @@ catalog-sync/
 │
 ├── catalog_gateway/             # Iceberg REST Catalog proxy + OPA enforcement
 │   ├── main.py                  # Catch-all proxy: JWT validate, OPA check, enforce, forward
+│   │                            #   _filter_manifest_list_sync() — virtual manifest-list for RLS
+│   │                            #   _pyiceberg_plan_scan()       — server-side scan planning
 │   ├── policy.py                # JWT validation (PyJWKClient) + OPA async client
-│   ├── requirements.txt
+│   ├── requirements.txt         # fastapi, uvicorn, httpx, pyjwt, pyiceberg[s3fs], fastavro
 │   └── Dockerfile
 │
 ├── opa/
@@ -170,7 +172,7 @@ catalog-sync/
    │   1. Validate client JWT via JWKS     ──────────────► oauth-service:8081    │
    │   2. POST /v1/data/iceberg/policy     ──────────────► opa:8181              │
    │      → allow / excluded_columns / row_filter / column_masks                 │
-   │   3. Enforce: 403 / schema rewrite / scan filter injection                  │
+   │   3. Enforce: 403 / schema rewrite / virtual manifest-list / col exclusion  │
    │   4. Forward with admin token         ──────────────► nessie:19120          │
    └──────────────────────────────────────────────────────────────────────────────┘
 
@@ -200,19 +202,37 @@ Spark (RESTCatalog → catalog-gateway:8083)
        → gateway validates Bearer JWT (analytics-client), extracts principal
        → gateway: POST /v1/data/iceberg/policy  (OPA)
          input:  {principal: "analytics-client", namespace: "gold", table: "orders", operation: "READ"}
-         result: {allow: true, excluded_columns: ["ssn","credit_card_number"], row_filter: null, column_masks: {...}}
+         result: {allow: true, excluded_columns: ["ssn","credit_card_number"], row_filter: "region = 'EMEA'", column_masks: {...}}
        → gateway: forwards GET to nessie with admin token
-       → gateway: strips ssn + credit_card_number from schema in response (Layer 4 hard CLS)
-       → gateway: stores column_masks as table property "gateway.column-masks" (Layer 3 advisory)
-       → Spark receives table metadata WITHOUT ssn / credit_card_number in schema
 
-  ② POST /v1/namespaces/gold/tables/orders/scan
-       → gateway: POST /v1/data/iceberg/policy  (OPA, SCAN operation)
-         result: {allow: true, row_filter: "region = 'EMEA'", ...}
-       → gateway: merges {"type":"eq","term":"region","value":"EMEA"} into scan filter
-       → forwards POST to nessie with merged filter
-       → Nessie prunes scan: only EMEA partition files returned (file-level pruning)
+       [Layer 2 — RLS via virtual manifest-list]
+       → gateway reads real manifest-list from MinIO via fastavro + FsspecFileIO
+       → for each manifest, reads data-file entries and keeps only those where
+         data_file.partition['region'] == 'EMEA'
+       → writes filtered manifest(s) and a new manifest-list to:
+            s3://warehouse/.gateway/{MD5(manifest_list_path+filter)[:16]}/
+       → returns table metadata with current snapshot's manifest-list URL replaced
+         by the virtual path: s3a://warehouse/.gateway/{cache_key}/snap.avro
+
+       [Layer 4 — hard CLS]
+       → gateway strips ssn + credit_card_number from schema in response
+
+       [Layer 3 — advisory column masks]
+       → gateway stores column_masks as table property "gateway.column-masks"
+
+       → Spark receives table metadata with:
+            - virtual manifest-list URL (only EMEA partition files are reachable)
+            - schema WITHOUT ssn / credit_card_number
+
+  ② Spark performs local scan planning (standard Iceberg RESTCatalog behavior)
+       → downloads virtual manifest-list from MinIO → only EMEA partition files listed
+       → downloads EMEA manifest → fetches only EMEA Parquet files
        → Spark reads 2 rows from EMEA Parquet files only
+
+  NOTE: Spark's Iceberg RESTCatalog (iceberg-spark-runtime 1.9.1) does NOT call
+  POST /scan during table reads even when rest.scan-planning-enabled=true is set.
+  Manifests are read directly from S3. The gateway's /scan endpoint exists and
+  enforces RLS via PyIceberg for clients that do call it (e.g. direct API callers).
 ```
 
 ### Request lifecycle for a sync CLI write (sync-service)
@@ -1129,8 +1149,22 @@ curl -s -X POST http://localhost:8181/v1/data/iceberg/policy \
 
 ## 8.11 Test Row-Level Security (RLS)
 
-RLS is enforced by the gateway injecting an Iceberg scan filter expression into every
-`POST /scan` request. Nessie uses the filter for file-level partition pruning.
+RLS is enforced transparently by the gateway using two complementary mechanisms:
+
+1. **Virtual manifest-list (primary, for Spark and all direct-S3 clients):** On every
+   `GET /tables/{table}` with a non-null `row_filter`, the gateway writes a filtered
+   copy of the Iceberg manifest-list (and filtered manifests) to MinIO under
+   `s3://warehouse/.gateway/{cache_key}/`. The snapshot URL in the table metadata
+   response points to this virtual copy — Spark downloads it and only sees allowed
+   partition files, with no explicit filter call needed.
+
+2. **Scan endpoint (for callers that use server-side scan planning):** `POST /scan`
+   requests have the OPA `row_filter` merged into the scan expression. This path is
+   active for clients that explicitly call the scan API.
+
+> **Spark note:** `iceberg-spark-runtime 1.9.1` does NOT call `POST /scan` during
+> table reads even with `rest.scan-planning-enabled=true`. The virtual manifest-list
+> approach (mechanism 1) is what enforces RLS for Spark.
 
 ```bash
 TOKEN_ANALYTICS=$(curl -s -X POST http://localhost:8081/token \
@@ -1369,10 +1403,10 @@ Catalog: gw_ds
 | Assertion | How enforced |
 |-----------|-------------|
 | admin: 6 rows, ssn visible | no restrictions |
-| analytics: 2 rows, no explicit filter | gateway injects scan filter → Nessie partition pruning |
-| analytics: ssn absent from df.columns | gateway strips from schema before Spark plans query |
-| analytics: only EMEA regions | scan filter prevents other files from being fetched |
-| data-scientist: exception on gold | gateway returns HTTP 403 |
+| analytics: 2 rows, no explicit filter | gateway rewrites snapshot manifest-list → virtual copy with only EMEA partition files |
+| analytics: ssn absent from df.columns | gateway strips excluded columns from schema (Layer 4 CLS) |
+| analytics: only EMEA regions | virtual manifest-list contains no APAC/AMER manifest entries |
+| data-scientist: exception on gold | gateway returns HTTP 403 (Layer 1 deny) |
 
 ### Troubleshooting
 
@@ -1533,8 +1567,9 @@ allow if {
 | Layer | Trigger | How |
 |-------|---------|-----|
 | 1 — Allow/Deny | Every table request | `if not dec.allow: raise HTTPException(403)` |
+| 2 — Row filter (GET) | `GET /tables/{t}` with `row_filter` | `_filter_manifest_list()` writes virtual filtered manifest-list to MinIO; snapshot URL replaced in response — Spark reads only allowed partition files |
+| 2 — Row filter (SCAN) | `POST /tables/{t}/scan` | `_sql_to_iceberg_expr()` converts SQL → Iceberg expr, merged with AND; `_plan_scan()` uses PyIceberg to apply row filter |
 | 4 — Column exclusion | `GET /tables/{t}` | `_strip_columns(meta, excluded)` removes fields from schema JSON |
-| 2 — Row filter | `POST /tables/{t}/scan` | `_sql_to_iceberg_expr()` converts SQL → Iceberg expr, merged with AND |
 | 3 — Column masks | `GET /tables/{t}` | Stored as `gateway.column-masks` table property (advisory) |
 
 **Hot reload:** OPA watches the `/policies` volume mount. Edit any `.rego` file → OPA
@@ -1574,6 +1609,37 @@ code. This means:
 - Clients cannot bypass enforcement by skipping an API call — enforcement is on the path
 - Nessie's port 19120 is not exposed to the host — the gateway is the sole entry point
 - Fail-closed: gateway returns 403 if OPA is unreachable
+
+### Virtual Manifest-List for Row-Level Security
+
+Spark's Iceberg RESTCatalog client (tested with `iceberg-spark-runtime 1.9.1`) performs
+**local scan planning** — it downloads manifest files directly from MinIO via S3A and
+never calls the gateway's `POST /scan` endpoint, even when `rest.scan-planning-enabled=true`
+is advertised. The gateway's scan endpoint exists and works (it uses PyIceberg server-side
+planning) but Spark's `SparkBatchScan` does not use it.
+
+To enforce row-level security transparently for Spark:
+
+1. On every `GET /tables/{table}` with a non-null OPA `row_filter`, the gateway:
+   - Reads the real manifest-list from MinIO (`fastavro` + `FsspecFileIO`)
+   - For each manifest, filters `data_file` entries to only those whose
+     `partition[col]` matches the filter value
+   - Writes filtered manifest files and a new manifest-list to
+     `s3://warehouse/.gateway/{cache_key}/` (MinIO)
+   - Returns the table metadata with the current snapshot's `manifest-list` URL
+     replaced by the virtual path (`s3a://warehouse/.gateway/{cache_key}/snap.avro`)
+2. Spark downloads what it believes is the real manifest-list and only sees
+   allowed partition files — no code change or explicit filter call needed
+
+**Cache:** The cache key is `MD5(manifest_list_path + ":" + filter_sql)[:16]`.
+Since every Nessie commit produces a new manifest-list path, the cache key changes
+automatically when the table is updated. Cache entries accumulate in MinIO under
+`s3://warehouse/.gateway/`; cleanup is out of scope.
+
+**Limitation:** Only equality predicates (`col = 'value'`) are parsed. Complex
+expressions are logged as a warning and the unfiltered metadata is returned as fallback.
+
+---
 
 ### Iceberg REST Catalog, Not Nessie Native API
 
@@ -1799,6 +1865,32 @@ If blobs live at `container/iceberg/gold/...`, the root must include the inner p
 abfss://iceberg@account.dfs.core.windows.net/iceberg   ✓
 abfss://iceberg@account.dfs.core.windows.net/           ✗
 ```
+
+### `ModuleNotFoundError: No module named 'fastavro'` in catalog-gateway
+
+`pyiceberg[s3fs]` does **not** include `fastavro` — it's under PyIceberg's optional
+`[avro]` extra group. The gateway's virtual manifest-list filtering uses `fastavro`
+directly. If it's missing, `GET /tables/{table}` will return 500 for any principal
+with a non-null `row_filter`.
+
+**Fix:** `catalog_gateway/requirements.txt` must include `fastavro>=1.8.2`.
+After adding it, rebuild the container:
+
+```bash
+docker compose build --no-cache catalog-gateway
+docker compose up -d catalog-gateway
+```
+
+---
+
+### `Could not load a FileIO: No module named ...` in catalog-gateway
+
+PyIceberg cannot auto-detect which FileIO to use for `s3://` or `s3a://` URIs
+without an explicit hint. The gateway passes `"py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO"`
+in all `StaticTable.from_metadata()` calls. If this key is missing (e.g. after a
+refactor), PyIceberg raises a `ModuleNotFoundError` with a message about FileIO.
+
+---
 
 ### Spark warehouse trailing slash
 

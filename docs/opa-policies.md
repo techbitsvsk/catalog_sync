@@ -13,8 +13,9 @@ Client JWT  →  catalog-gateway:8083  →  POST /v1/data/iceberg/policy  →  o
                       │                        ↑
                       │                   iceberg.rego (hot-reload)
                       ↓
-              Enforce: 403 / schema rewrite / scan filter / table property
-                      │
+              Enforce: 403 / schema rewrite / virtual manifest-list / table property
+                      │                              │
+                      │           (filtered manifests written to MinIO .gateway/)
                       ↓
                   nessie:19120  (admin token, never client token)
 ```
@@ -29,7 +30,7 @@ request. Policy files are hot-reloaded from the mounted volume — no restart ne
 | Layer | Type | Mechanism | Bypass-proof? |
 |-------|------|-----------|---------------|
 | **1** Table access | Hard | OPA `allow=false` → gateway returns HTTP 403 | Yes — on the network path |
-| **2** Row filter | Hard | Gateway injects Iceberg scan filter → Nessie partition pruning | Yes — scan filter is in the catalog protocol |
+| **2** Row filter | Hard | **Virtual manifest-list:** gateway writes a filtered copy of the Iceberg manifest-list to MinIO and replaces the snapshot URL in the GET table response. Spark downloads only allowed partition files. Also enforced via PyIceberg scan planning on `POST /scan`. | Yes — Spark reads from the manifest-list the gateway provides |
 | **3** Column masking | Advisory | Stored as `gateway.column-masks` table property | No — query engine must apply it |
 | **4** Column exclusion | Hard | Gateway strips columns from table schema response | Yes — Spark never sees excluded fields |
 
@@ -205,6 +206,44 @@ Keep row filter expressions simple. Complex predicates require Trino OPA integra
 
 ---
 
+## How row-level security actually works (virtual manifest-list)
+
+Spark's Iceberg RESTCatalog client (tested with `iceberg-spark-runtime 1.9.1`) performs
+**local scan planning** — it downloads manifest files directly from MinIO via S3A and
+never calls `POST /tables/{table}/scan`, even when `rest.scan-planning-enabled=true` is
+advertised. Injecting a filter into the scan response body would have no effect.
+
+To enforce RLS transparently, the gateway uses a **virtual manifest-list**:
+
+```
+GET /v1/namespaces/gold/tables/orders  (analytics-client)
+          │
+          ▼ OPA returns: row_filter = "region = 'EMEA'"
+          │
+          ▼ Gateway reads real manifest-list from MinIO (fastavro)
+          │   manifest-list.avro
+          │   └─ manifest-0.avro  → data_file entries for EMEA + APAC + AMER
+          │
+          ▼ For each manifest, keep only entries where partition['region'] == 'EMEA'
+          │
+          ▼ Write filtered files to MinIO:
+          │   s3://warehouse/.gateway/{cache_key}/snap.avro      ← virtual manifest-list
+          │   s3://warehouse/.gateway/{cache_key}/m-0.avro       ← EMEA-only manifest
+          │
+          ▼ Return table metadata with snapshot["manifest-list"] replaced:
+              "manifest-list": "s3a://warehouse/.gateway/{cache_key}/snap.avro"
+          │
+          ▼ Spark downloads virtual manifest-list
+              → only EMEA partition files listed
+              → Spark reads 2 rows from EMEA Parquet files only
+              → No app-level filter() call needed
+```
+
+**Cache:** Key = `MD5(manifest_list_path + ":" + filter)[:16]`. Automatically invalidates
+when the table is updated (new Nessie commit → new manifest-list path → new cache key).
+
+---
+
 ## Testing policies
 
 **Query OPA directly:**
@@ -260,7 +299,8 @@ This seeds a real Iceberg v2 table in Nessie via the gateway and verifies that:
 | Client skips policy call | Impossible — enforcement is in the gateway, not client code |
 | Client accesses Nessie directly | Nessie port 19120 is not exposed to host — only `iceberg-net` internal |
 | Client reads excluded columns | Gateway strips them from schema; Spark can't project columns it doesn't know exist |
-| Client reads non-EMEA rows | Gateway injects scan filter; Nessie returns only EMEA partition files |
+| Client reads non-EMEA rows | Gateway rewrites snapshot manifest-list URL to a virtual filtered copy in MinIO; Spark only downloads EMEA partition files |
+| Client calls `/scan` directly | Gateway's scan handler applies OPA `row_filter` via PyIceberg scan planning |
 | OPA is down | Gateway returns HTTP 500 — never fails open |
 
 > **Column masking (Layer 3) is advisory.** The gateway stores masks as a table property.

@@ -78,13 +78,16 @@ def _catalog_configs(name: str, client_id: str, client_secret: str, scope: str) 
     """
     p = f"spark.sql.catalog.{name}"
     return {
-        f"{p}":                    "org.apache.iceberg.spark.SparkCatalog",
-        f"{p}.type":               "rest",
-        f"{p}.uri":                GATEWAY_URL,
-        f"{p}.credential":         f"{client_id}:{client_secret}",
-        f"{p}.oauth2-server-uri":  f"{OAUTH_URL}/token",
-        f"{p}.scope":              scope,
-        f"{p}.warehouse":          WAREHOUSE,
+        f"{p}":                             "org.apache.iceberg.spark.SparkCatalog",
+        f"{p}.type":                        "rest",
+        f"{p}.uri":                         GATEWAY_URL,
+        f"{p}.credential":                  f"{client_id}:{client_secret}",
+        f"{p}.oauth2-server-uri":           f"{OAUTH_URL}/token",
+        f"{p}.scope":                       scope,
+        f"{p}.warehouse":                   WAREHOUSE,
+        # Use gateway's server-side scan planning so it can enforce RLS
+        # (row filter injection, column exclusion) transparently.
+        f"{p}.rest.scan-planning-enabled":  "true",
     }
 
 

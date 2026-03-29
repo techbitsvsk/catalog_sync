@@ -98,6 +98,175 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Catalog Gateway", version="1.0.0", lifespan=lifespan)
 
 
+# ── Virtual manifest-list (row-level security for local scan planning) ────────
+
+
+def _filter_manifest_list_sync(meta: dict, row_filter_sql: str) -> dict:  # noqa: C901
+    """
+    Write a virtual manifest-list to MinIO that only contains manifests
+    matching row_filter_sql, then return a copy of meta with the current
+    snapshot's manifest-list path replaced by the virtual one.
+
+    The Iceberg manifest-list is a small Avro file (one entry per manifest).
+    We read it, filter the partition-level summaries, and write a new one.
+    Spark downloads the manifest-list directly from MinIO — by pointing it
+    to the filtered copy the gateway enforces RLS without Spark cooperation.
+
+    Results are cached per (manifest-list-path × filter); the cache key is
+    a hash so it changes automatically when the table is updated.
+    """
+    import copy
+    import copy
+    import hashlib
+    import io as _io
+
+    import fastavro
+    from pyiceberg.io.fsspec import FsspecFileIO
+
+    metadata = meta.get("metadata", {})
+    current_snap_id = metadata.get("current-snapshot-id")
+    if current_snap_id is None:
+        return meta
+
+    current_snap = next(
+        (s for s in metadata.get("snapshots", [])
+         if s.get("snapshot-id") == current_snap_id),
+        None,
+    )
+    if current_snap is None:
+        return meta
+
+    manifest_list_loc = current_snap.get("manifest-list", "")
+    if not manifest_list_loc:
+        return meta
+
+    # Deterministic cache key: changes whenever the manifest-list changes
+    cache_key = hashlib.md5(
+        f"{manifest_list_loc}:{row_filter_sql}".encode()
+    ).hexdigest()[:16]
+    virt_base    = f"s3://warehouse/.gateway/{cache_key}"
+    virt_ml_s3   = f"{virt_base}/snap.avro"
+    virt_ml_s3a  = virt_ml_s3.replace("s3://", "s3a://")
+
+    file_io = FsspecFileIO({
+        "s3.endpoint":          S3_ENDPOINT,
+        "s3.access-key-id":     S3_ACCESS_KEY,
+        "s3.secret-access-key": S3_SECRET_KEY,
+        "s3.path-style-access": "true",
+        "s3.region":            "us-east-1",
+    })
+
+    # Return cached result if the virtual manifest-list already exists
+    try:
+        with file_io.new_input(virt_ml_s3).open() as f:
+            f.read(4)
+        # Cache hit — just patch the URL and return
+        meta_copy = copy.deepcopy(meta)
+        for snap in meta_copy.get("metadata", {}).get("snapshots", []):
+            if snap.get("snapshot-id") == current_snap_id:
+                snap["manifest-list"] = virt_ml_s3a
+                break
+        return meta_copy
+    except Exception:
+        pass
+
+    # Parse the equality filter (col = 'val')
+    m = re.match(r"^(\w+)\s*=\s*'([^']*)'$", row_filter_sql.strip())
+    if not m:
+        log.warning("Cannot parse row_filter for manifest filtering: %r", row_filter_sql)
+        return meta
+    filter_col, filter_val = m.group(1), m.group(2)
+
+    ml_s3 = manifest_list_loc.replace("s3a://", "s3://")
+
+    # Read the manifest-list
+    with file_io.new_input(ml_s3).open() as f:
+        ml_reader   = fastavro.reader(f)
+        ml_schema   = ml_reader.writer_schema
+        ml_entries  = list(ml_reader)
+
+    # For each manifest, read and filter its data-file entries, then write
+    # a new filtered manifest.  The manifests may contain files from multiple
+    # partitions, so we filter at the data-file level (not manifest-list level).
+    new_ml_entries = []
+    for ml_entry in ml_entries:
+        raw_manifest_path = ml_entry.get("manifest_path", "")
+        manifest_s3 = raw_manifest_path.replace("s3a://", "s3://")
+
+        # Read manifest
+        with file_io.new_input(manifest_s3).open() as f:
+            mf_reader  = fastavro.reader(f)
+            mf_schema  = mf_reader.writer_schema
+            mf_entries = list(mf_reader)
+
+        # Filter to only the entries that match the partition filter.
+        # Partition values in data_file.partition are plain Python values
+        # (str for STRING type) — no binary encoding needed.
+        kept = [
+            e for e in mf_entries
+            if e.get("data_file", {}).get("partition", {}).get(filter_col) == filter_val
+        ]
+        if not kept:
+            continue  # entire manifest excluded — omit from virtual ml
+
+        # Write filtered manifest to virtual prefix
+        virt_mf_s3 = f"{virt_base}/m-{len(new_ml_entries)}.avro"
+        buf = _io.BytesIO()
+        fastavro.writer(buf, mf_schema, kept)
+        mf_bytes = buf.getvalue()
+        with file_io.new_output(virt_mf_s3).create() as f:
+            f.write(mf_bytes)
+
+        # Build updated manifest-list entry for the new (filtered) manifest
+        added_rows = sum(
+            e.get("data_file", {}).get("record_count", 0) for e in kept
+        )
+        new_ml_entry = dict(ml_entry)
+        new_ml_entry["manifest_path"]           = virt_mf_s3.replace("s3://", "s3a://")
+        new_ml_entry["manifest_length"]         = len(mf_bytes)
+        new_ml_entry["added_data_files_count"]  = len(kept)
+        new_ml_entry["existing_data_files_count"] = 0
+        new_ml_entry["deleted_data_files_count"] = 0
+        new_ml_entry["added_rows_count"]        = added_rows
+        new_ml_entry["existing_rows_count"]     = 0
+        new_ml_entry["deleted_rows_count"]      = 0
+        # Update partition bounds to match the single allowed value
+        val_bytes = filter_val.encode("utf-8")
+        if new_ml_entry.get("partitions"):
+            new_ml_entry["partitions"] = [
+                {**p, "lower_bound": val_bytes, "upper_bound": val_bytes}
+                for p in new_ml_entry["partitions"]
+            ]
+        new_ml_entries.append(new_ml_entry)
+
+    log.info(
+        "Virtual manifest-list: %d→%d manifests for filter %r",
+        len(ml_entries), len(new_ml_entries), row_filter_sql,
+    )
+
+    # Write the virtual manifest-list
+    buf = _io.BytesIO()
+    fastavro.writer(buf, ml_schema, new_ml_entries)
+    with file_io.new_output(virt_ml_s3).create() as f:
+        f.write(buf.getvalue())
+
+    # Return a deep copy with the snapshot pointing to the virtual manifest-list
+    meta_copy = copy.deepcopy(meta)
+    for snap in meta_copy.get("metadata", {}).get("snapshots", []):
+        if snap.get("snapshot-id") == current_snap_id:
+            snap["manifest-list"] = virt_ml_s3a
+            break
+    return meta_copy
+
+
+async def _filter_manifest_list(meta: dict, row_filter_sql: str) -> dict:
+    """Async wrapper: runs manifest filtering in a thread-pool executor."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, _filter_manifest_list_sync, meta, row_filter_sql
+    )
+
+
 # ── Server-side scan planning (PyIceberg) ────────────────────────────────────
 
 def _pyiceberg_plan_scan(
@@ -122,6 +291,7 @@ def _pyiceberg_plan_scan(
     loc = metadata_location.replace("s3a://", "s3://")
 
     props = {
+        "py-io-impl":           "pyiceberg.io.fsspec.FsspecFileIO",
         "s3.endpoint":          S3_ENDPOINT,
         "s3.access-key-id":     S3_ACCESS_KEY,
         "s3.secret-access-key": S3_SECRET_KEY,
@@ -347,6 +517,15 @@ async def gateway(request: Request, path: str):
                         "nessie.iceberg-base-uri"):
                 cfg.get("overrides", {}).pop(key, None)
             cfg.get("overrides", {}).pop("nessie.prefix-pattern", None)
+            # Tell the Iceberg Java client to use server-side scan planning so
+            # the gateway can enforce row-level security (Layer 2 / RLS).
+            cfg.setdefault("overrides", {})["rest.scan-planning-enabled"] = "true"
+            # Advertise the scan endpoint — the Java client only uses server-side
+            # planning if this entry appears in the endpoints list.
+            scan_ep = "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/scan"
+            endpoints = cfg.setdefault("endpoints", [])
+            if scan_ep not in endpoints:
+                endpoints.append(scan_ep)
             return JSONResponse(cfg)
         return _resp(r)
 
@@ -400,6 +579,14 @@ async def gateway(request: Request, path: str):
         if cfg is not meta.get("config"):   # ensure the key exists if config was absent
             meta["config"] = cfg
 
+        # Layer 2 — rewrite manifest-list to filter to allowed partitions (RLS)
+        # Spark downloads manifests directly from S3, bypassing the /scan
+        # endpoint.  We write a virtual manifest-list to MinIO that contains
+        # only the manifests whose partition bounds match the OPA row_filter,
+        # then return the snapshot pointing at the virtual manifest-list.
+        if dec.row_filter:
+            meta = await _filter_manifest_list(meta, dec.row_filter)
+
         # Layer 4 — remove excluded columns from schema (hard CLS)
         if dec.excluded_columns:
             _strip_columns(meta, set(dec.excluded_columns))
@@ -412,7 +599,7 @@ async def gateway(request: Request, path: str):
 
         return JSONResponse(meta)
 
-    # ── POST /tables/{table}/scan — scan planning with RLS filter injection ───
+    # ── POST /tables/{table}/scan — PyIceberg server-side scan planning ─────
     if request.method == "POST" and suffix == "/scan":
         dec = await get_policy(principal, namespace, table, "SCAN")
         if not dec.allow:
@@ -421,21 +608,27 @@ async def gateway(request: Request, path: str):
             )
         body = await request.json()
 
-        # Layer 2 — merge security filter into scan request (RLS)
-        if dec.row_filter:
-            expr = _sql_to_iceberg_expr(dec.row_filter)
-            if expr:
-                body["filter"] = _merge_filter(body.get("filter"), expr)
+        # Fetch table metadata from Nessie to get the metadata-location.
+        table_path = path.removesuffix("/scan")
+        r = await _nessie(request.app.state, "GET", table_path,
+                          params=dict(request.query_params))
+        if r.status_code != 200:
+            return _resp(r)
+        meta_resp = r.json()
+        metadata_location = (meta_resp.get("metadata-location") or
+                             meta_resp.get("metadata", {}).get("location"))
+        if not metadata_location:
+            raise HTTPException(500, "Cannot determine metadata-location for scan planning")
 
-        # Defence-in-depth: remove excluded cols from explicit projection
-        if dec.excluded_columns and "select" in body:
-            exc = set(dec.excluded_columns)
-            body["select"] = [c for c in body["select"] if c not in exc]
-
-        r = await _nessie(
-            request.app.state, "POST", path, body=json.dumps(body).encode()
+        # Layer 2 + 4 — PyIceberg applies row filter and column projection.
+        select = body.get("select")
+        result = await _plan_scan(
+            metadata_location,
+            dec.row_filter,
+            dec.excluded_columns or [],
+            select,
         )
-        return _resp(r)
+        return JSONResponse(result)
 
     # ── Write / Drop — check OPA before proxying ──────────────────────────────
     if request.method in ("POST", "PUT", "PATCH", "DELETE"):

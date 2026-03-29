@@ -79,10 +79,12 @@ flowchart TD
 
 ```
 ⑥ Authenticate   OAuth 2.0 client credentials; RS256 JWT; OIDC discovery
-⑦ Authorize      OPA allow/deny via Rego policy → HTTP 403 from gateway    (hard — Layer 1)
-⑧ RLS            Iceberg scan filter injected by gateway → Nessie prunes    (hard — Layer 2)
-⑨ CLS            Column exclusion: schema rewrite removes fields from metadata (hard — Layer 4)
-                 Column masking:   stored as table property; query engine applies (advisory — Layer 3)
+⑦ Authorize      OPA allow/deny via Rego policy → HTTP 403 from gateway                (hard — Layer 1)
+⑧ RLS            Virtual manifest-list: gateway writes filtered copy to MinIO,          (hard — Layer 2)
+                   rewrites snapshot URL in GET table response → Spark downloads
+                   only allowed partition files (transparent, no Spark cooperation)
+⑨ CLS            Column exclusion: schema rewrite removes fields from metadata           (hard — Layer 4)
+                 Column masking:   stored as table property; query engine applies       (advisory — Layer 3)
 ```
 
 ---
@@ -198,7 +200,7 @@ flowchart LR
     OPA -- allow · excl · filter · masks --> GW
     GW -- L1: 403 if denied --> CLIENT
     GW -- L4: strip excluded cols\nfrom schema response --> CLIENT
-    GW -- L2: merge scan filter --> NESSIE
+    GW -- L2: write virtual\nmanifest-list --> MINIO
     GW -- L3: embed masks\nas table property --> CLIENT
     GW -- admin token --> NESSIE
 ```
@@ -262,8 +264,10 @@ catalog-sync/
 │
 ├── catalog_gateway/               # Iceberg REST Catalog proxy + OPA enforcement (FastAPI)
 │   ├── main.py                    # Catch-all proxy: JWT validate, OPA check, enforce, forward
+│   │                              #   _filter_manifest_list_sync() — virtual manifest-list RLS
+│   │                              #   _pyiceberg_plan_scan()       — server-side scan planning
 │   ├── policy.py                  # JWT validation (PyJWKClient) + OPA async client
-│   ├── requirements.txt
+│   ├── requirements.txt           # includes fastavro for manifest Avro read/write
 │   └── Dockerfile
 │
 ├── opa/

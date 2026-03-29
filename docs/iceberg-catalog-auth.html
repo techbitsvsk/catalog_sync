@@ -801,7 +801,7 @@ flowchart TD
   <table>
     <tr><th>Layer</th><th>Type</th><th>Mechanism</th><th>Can client bypass?</th></tr>
     <tr><td>1 — Table access</td><td><strong style="color:var(--red)">Hard</strong></td><td>OPA <code>allow=false</code> → gateway returns HTTP 403</td><td>No — on the network path</td></tr>
-    <tr><td>2 — Row filter</td><td><strong style="color:var(--red)">Hard</strong></td><td>Gateway injects Iceberg scan filter expression → Nessie prunes at file level</td><td>No — scan filter is in the catalog protocol</td></tr>
+    <tr><td>2 — Row filter</td><td><strong style="color:var(--red)">Hard</strong></td><td>Gateway writes a virtual filtered manifest-list to MinIO and replaces the snapshot URL in the GET table response — Spark downloads only allowed partition files. Also enforced on <code>POST /scan</code> via PyIceberg.</td><td>No — Spark reads from the manifest-list the gateway provides</td></tr>
     <tr><td>3 — Column masking</td><td><strong style="color:var(--amber)">Advisory</strong></td><td>Stored as <code>gateway.column-masks</code> table property</td><td>Yes — query engine must apply it</td></tr>
     <tr><td>4 — Column exclusion</td><td><strong style="color:var(--red)">Hard</strong></td><td>Gateway strips excluded columns from schema response</td><td>No — Spark can't project columns it doesn't see in the schema</td></tr>
   </table>
