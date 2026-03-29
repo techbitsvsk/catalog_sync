@@ -1,0 +1,851 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Iceberg Catalog — Local Setup &amp; Auth Deep Dive</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <style>
+    :root {
+      --bg:        #0f1117;
+      --surface:   #1a1d27;
+      --border:    #2a2d3e;
+      --text:      #e2e8f0;
+      --muted:     #8892a4;
+      --accent:    #60a5fa;
+      --green:     #34d399;
+      --amber:     #fbbf24;
+      --red:       #f87171;
+      --purple:    #a78bfa;
+      --mono:      'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 15px;
+      line-height: 1.7;
+    }
+
+    /* ── Layout ── */
+    .page { max-width: 980px; margin: 0 auto; padding: 48px 24px 96px; }
+
+    /* ── Typography ── */
+    h1 { font-size: 2rem; font-weight: 700; color: var(--accent); margin-bottom: 8px; }
+    h2 { font-size: 1.35rem; font-weight: 600; color: var(--text); margin: 48px 0 16px;
+         padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+    h3 { font-size: 1.05rem; font-weight: 600; color: var(--accent); margin: 28px 0 10px; }
+    p  { color: var(--muted); margin-bottom: 12px; }
+    strong { color: var(--text); }
+    a  { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    .subtitle { color: var(--muted); font-size: 1rem; margin-bottom: 32px; }
+
+    /* ── Diagram card ── */
+    .diagram-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 28px 24px;
+      margin: 20px 0 32px;
+      overflow-x: auto;
+    }
+    .diagram-card .mermaid { display: flex; justify-content: center; }
+
+    /* ── Callout boxes ── */
+    .callout {
+      border-left: 3px solid var(--accent);
+      background: #1e2235;
+      border-radius: 0 8px 8px 0;
+      padding: 14px 18px;
+      margin: 16px 0 24px;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+    .callout.green  { border-color: var(--green);  }
+    .callout.amber  { border-color: var(--amber);  }
+    .callout.purple { border-color: var(--purple); }
+    .callout strong { color: var(--text); }
+
+    /* ── Key/value table ── */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.88rem;
+      margin: 16px 0 24px;
+    }
+    th {
+      text-align: left;
+      padding: 8px 12px;
+      background: #20243a;
+      color: var(--accent);
+      font-weight: 600;
+      border-bottom: 1px solid var(--border);
+    }
+    td {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      color: var(--muted);
+      vertical-align: top;
+    }
+    tr:last-child td { border-bottom: none; }
+    td:first-child, th:first-child { color: var(--text); font-family: var(--mono); font-size: 0.83rem; }
+
+    /* ── Code inline ── */
+    code {
+      font-family: var(--mono);
+      font-size: 0.83em;
+      background: #20243a;
+      color: var(--green);
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+
+    /* ── Tag pills ── */
+    .tag {
+      display: inline-block;
+      font-size: 0.72rem;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 99px;
+      margin-left: 6px;
+      vertical-align: middle;
+    }
+    .tag-blue   { background: #1e3a5f; color: var(--accent); }
+    .tag-green  { background: #14432a; color: var(--green);  }
+    .tag-amber  { background: #44330a; color: var(--amber);  }
+    .tag-purple { background: #2d1b69; color: var(--purple); }
+
+    /* ── Section nav ── */
+    .toc {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px 24px;
+      margin-bottom: 48px;
+    }
+    .toc ol { padding-left: 20px; }
+    .toc li { margin: 4px 0; color: var(--muted); font-size: 0.9rem; }
+    .toc a  { color: var(--accent); }
+
+    /* ── Comparison grid ── */
+    .compare {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin: 16px 0 24px;
+    }
+    .compare-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      font-size: 0.88rem;
+    }
+    .compare-box h4 { font-size: 0.88rem; margin-bottom: 8px; }
+    .compare-box.bad  { border-color: #7f1d1d; }
+    .compare-box.good { border-color: #14532d; }
+    .compare-box h4.bad  { color: var(--red);   }
+    .compare-box h4.good { color: var(--green); }
+    .compare-box ul { padding-left: 16px; color: var(--muted); line-height: 2; }
+
+    hr { border: none; border-top: 1px solid var(--border); margin: 48px 0; }
+  </style>
+</head>
+<body>
+<div class="page">
+
+  <h1>Iceberg Catalog &mdash; Local Setup &amp; Auth Deep Dive</h1>
+  <p class="subtitle">
+    How the local stack is wired together, what Nessie actually stores, how every query engine
+    authenticates, and how OPA + catalog-gateway enforce access control at the infrastructure layer.
+  </p>
+
+  <div class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#stack">Local stack — what each service does</a></li>
+      <li><a href="#iceberg">What Iceberg actually stores (the metadata chain)</a></li>
+      <li><a href="#nessie">Nessie as a catalog — what it stores vs MinIO</a></li>
+      <li><a href="#oauth">OAuth2 token flow — issuing and validating JWTs</a></li>
+      <li><a href="#spark-bearer">BEARER approach (old) — why it breaks</a></li>
+      <li><a href="#spark-oauth2">Spark RESTCatalog — catalog-per-principal via gateway</a></li>
+      <li><a href="#query-lifecycle">Full query lifecycle — gateway-enforced read</a></li>
+      <li><a href="#engines">Other query engines — Trino, Flink, PyIceberg</a></li>
+      <li><a href="#policy">OPA policy enforcement — infrastructure-level</a></li>
+    </ol>
+  </div>
+
+
+  <!-- ════════════════════════════════════════════════════════════════ -->
+  <h2 id="stack">1. Local stack — what each service does</h2>
+
+  <p>
+    Seven containers. Nessie is <strong>not exposed to the host</strong> — all client traffic
+    goes through the catalog-gateway (port 8083), which is the sole enforcement point.
+    MinIO <strong>never knows about table schemas</strong> — it only stores bytes.
+  </p>
+
+  <div class="diagram-card">
+    <div class="mermaid">
+flowchart TD
+    subgraph AUTH["Auth &amp; Policy layer  :8081  :8083  :8181"]
+        OAUTH["oauth-service :8081\nFastAPI · RS256 JWT issuer\nOIDC discovery · JWKS endpoint\nPostgreSQL: clients + RSA keys"]
+        GW["catalog-gateway :8083\nFastAPI · Iceberg REST Catalog proxy\nJWT validate → OPA check → enforce\nForwards to Nessie with admin token"]
+        OPA["opa :8181\nOpen Policy Agent\nRego policies · hot-reload\nPOST /v1/data/iceberg/policy"]
+    end
+
+    subgraph CATALOG["Catalog layer  (internal only)"]
+        NESSIE["Nessie :19120\nTransactional Iceberg catalog\nNOT host-exposed — iceberg-net only\nJWT auth via Quarkus OIDC"]
+    end
+
+    subgraph STORE["Storage layer  :9000"]
+        MINIO["MinIO\nS3-compatible object store\nActual bytes:\n  metadata.json\n  manifest.avro\n  data.parquet"]
+    end
+
+    subgraph DB["Database  :5432"]
+        PG["PostgreSQL\nnessie DB — commit log + refs\noauth DB — clients + keys\nairflow DB — DAG state"]
+    end
+
+    subgraph CLIENT["Client (Spark / CLI / Airflow)"]
+        SPARK["Query engine\nor iceberg-sync CLI"]
+    end
+
+    SPARK -->|"POST /token\nclient_credentials"| OAUTH
+    OAUTH -->|"RS256 JWT"| SPARK
+    SPARK -->|"Bearer JWT\nIceberg REST :8083"| GW
+    GW -->|"validate JWT\nGET JWKS"| OAUTH
+    GW -->|"POST /v1/data/iceberg/policy\nallow · excl_cols · row_filter · masks"| OPA
+    GW -->|"admin Bearer JWT\nforwarded request"| NESSIE
+    NESSIE -->|"GET JWKS\nverify admin JWT"| OAUTH
+    NESSIE ---|JDBC| PG
+    OAUTH ---|SQLAlchemy| PG
+    SPARK -->|"S3A — read/write\nParquet + metadata files"| MINIO
+    NESSIE -.->|"metadataLocation pointer\n(Nessie does NOT read/write files)"| MINIO
+
+    style AUTH    fill:#2d2a1a,stroke:#ca8a04
+    style CATALOG fill:#1a2540,stroke:#3b82f6
+    style STORE   fill:#1a2d1a,stroke:#22c55e
+    style DB      fill:#1f1f2e,stroke:#6b7280
+    style CLIENT  fill:#1a1d27,stroke:#a78bfa
+    </div>
+  </div>
+
+  <div class="callout">
+    <strong>Key separation:</strong> Nessie stores a <em>pointer</em>
+    (<code>metadataLocation: s3a://warehouse/gold/orders/metadata/v3.metadata.json</code>).
+    It never reads or writes Parquet files. The <strong>catalog-gateway</strong> is the sole
+    client entry point — it validates JWTs, enforces OPA policy, and forwards to Nessie
+    with its own admin token. Clients never speak to Nessie directly.
+  </div>
+
+
+  <!-- ════════════════════════════════════════════════════════════════ -->
+  <h2 id="iceberg">2. What Iceberg actually stores — the metadata chain</h2>
+
+  <p>
+    Every Iceberg table is a chain of immutable files. Each layer references the one below it
+    using absolute S3/GCS/ADLS URIs embedded in the file content itself. This is why
+    <strong>copying files without rewriting the chain produces a broken table</strong>.
+  </p>
+
+  <div class="diagram-card">
+    <div class="mermaid">
+flowchart TD
+    HINT["version-hint.text\n─────────────────\nContains: '3'\n(current version number)"]
+
+    META["v3.metadata.json\n────────────────────────────────────\nlocation: s3a://warehouse/gold/orders\ncurrent-snapshot-id: 8841234\nschema: {id BIGINT, region STRING, ...}\npartition-spec: [region]\nsnapshots: [ ... ]\ncurrent-schema-id: 0"]
+
+    MANLIST["snap-8841234-1-abc.avro\n(manifest-list)\n────────────────────────────────────\nOne row per manifest file:\n  manifest_path: s3a://.../m-001.avro\n  added_files_count: 3\n  partition_summaries: [{region: EMEA}]"]
+
+    MAN1["m-001.avro\n(manifest — EMEA partition)\n────────────────────────────────────\nOne row per data file:\n  file_path: s3a://.../emea-001.parquet\n  record_count: 150000\n  lower_bounds: {region: EMEA}\n  upper_bounds: {region: EMEA}"]
+
+    MAN2["m-002.avro\n(manifest — APAC partition)\n────────────────────────────────────\n  file_path: s3a://.../apac-001.parquet\n  record_count: 80000\n  lower_bounds: {region: APAC}\n  upper_bounds: {region: APAC}"]
+
+    P1["emea-001.parquet\n(Parquet data file)\n────────────────\nColumn stats in footer:\n  region: min=EMEA max=EMEA\n  amount: min=100 max=99000\nRow groups: 3\nRows: 150 000"]
+
+    P2["apac-001.parquet"]
+
+    NESSIE_PTR["Nessie catalog entry\n────────────────────────────────────\nkey: gold.orders\ntype: ICEBERG_TABLE\nmetadataLocation: s3a://warehouse/gold/orders/metadata/v3.metadata.json"]
+
+    NESSIE_PTR -->|"resolves to"| META
+    HINT -->|"v3 → loads"| META
+    META -->|"current-snapshot → manifest-list"| MANLIST
+    MANLIST -->|"manifest_path"| MAN1
+    MANLIST -->|"manifest_path"| MAN2
+    MAN1 -->|"file_path"| P1
+    MAN2 -->|"file_path"| P2
+
+    style NESSIE_PTR fill:#1a2540,stroke:#3b82f6
+    style META       fill:#1a2d1a,stroke:#22c55e
+    style MANLIST    fill:#1a2d1a,stroke:#22c55e
+    style MAN1       fill:#1a2d1a,stroke:#22c55e
+    style MAN2       fill:#1a2d1a,stroke:#22c55e
+    style P1         fill:#2d2a1a,stroke:#ca8a04
+    style P2         fill:#2d2a1a,stroke:#ca8a04
+    style HINT       fill:#1f1f2e,stroke:#6b7280
+    </div>
+  </div>
+
+  <table>
+    <tr><th>File</th><th>Format</th><th>Purpose</th><th>Contains absolute URIs?</th></tr>
+    <tr><td>version-hint.text</td><td>Plain text</td><td>Points to current metadata version number</td><td>No</td></tr>
+    <tr><td>v{n}.metadata.json</td><td>JSON</td><td>Table schema, partition spec, snapshot history, current snapshot pointer</td><td><strong style="color:var(--amber)">Yes — location, manifest-list paths</strong></td></tr>
+    <tr><td>snap-{id}-{n}.avro</td><td>Avro</td><td>Manifest list — one row per manifest file with partition summaries</td><td><strong style="color:var(--amber)">Yes — manifest_path</strong></td></tr>
+    <tr><td>m-{id}.avro</td><td>Avro</td><td>Manifest — one row per Parquet file with column-level statistics</td><td><strong style="color:var(--amber)">Yes — file_path</strong></td></tr>
+    <tr><td>{uuid}.parquet</td><td>Parquet</td><td>Actual row data. Footer contains column min/max per row group.</td><td>No (self-contained)</td></tr>
+  </table>
+
+  <div class="callout amber">
+    <strong>Why iceberg-sync rewrites the chain:</strong> When copying from Azure ADLS to MinIO,
+    every URI in <em>metadata.json</em>, <em>manifest-list.avro</em>, and <em>manifest.avro</em>
+    must change from <code>abfss://container@account.dfs.core.windows.net/…</code>
+    to <code>s3a://warehouse/…</code>. Only then is the table readable from the new location.
+    The Parquet files themselves do not embed their own path, so they need no modification.
+  </div>
+
+  <h3>How Iceberg scan planning uses column statistics</h3>
+  <p>
+    Each manifest row carries <strong>lower_bounds</strong> and <strong>upper_bounds</strong> per column,
+    copied from the Parquet file footers. When a query has a predicate like <code>region = 'EMEA'</code>,
+    Iceberg compares it against these bounds before opening any file:
+  </p>
+
+  <div class="diagram-card">
+    <div class="mermaid">
+flowchart LR
+    PRED["Predicate\nregion = 'EMEA'"]
+    ML["Manifest list\n2 manifests"]
+    M1["Manifest m-001\nlower=EMEA upper=EMEA"]
+    M2["Manifest m-002\nlower=APAC upper=APAC"]
+    SKIP["SKIP\n(APAC ≠ EMEA)"]
+    OPEN["OPEN file\nemea-001.parquet"]
+
+    PRED --> ML
+    ML --> M1
+    ML --> M2
+    M1 -->|"EMEA overlaps EMEA"| OPEN
+    M2 -->|"APAC cannot contain EMEA"| SKIP
+
+    style SKIP fill:#2d1a1a,stroke:#f87171
+    style OPEN fill:#1a2d1a,stroke:#34d399
+    </div>
+  </div>
+
+  <div class="callout green">
+    <strong>This is what structured scan expressions unlock in the catalog gateway.</strong>
+    When the gateway converts the OPA <code>row_filter</code> to a structured Iceberg expression
+    (<code>{type: eq, term: region, value: EMEA}</code>), Nessie can push the predicate into scan
+    planning — skipping entire Parquet partition files before reading a single row.
+    The gateway's <code>_sql_to_iceberg_expr()</code> handles this conversion automatically;
+    unsupported predicates are logged and skipped (fail-open for that filter).
+  </div>
+
+
+  <!-- ════════════════════════════════════════════════════════════════ -->
+  <h2 id="nessie">3. Nessie as a catalog — what it stores vs MinIO</h2>
+
+  <p>
+    Nessie is a <strong>transactional metadata store</strong> — think Git for table definitions.
+    It does not touch object storage. Its job is to atomically record which
+    <code>metadataLocation</code> is the current version of each table, on each branch.
+  </p>
+
+  <div class="diagram-card">
+    <div class="mermaid">
+flowchart LR
+    subgraph NESSIE_STORE["Nessie (PostgreSQL backend)"]
+        direction TB
+        MAIN["main branch\n─────────────────────────\ngold.orders → v3.metadata.json\ngold.customers → v1.metadata.json\nsilver.events → v7.metadata.json"]
+        DEV["dev branch\n─────────────────────────\ngold.orders → v4.metadata.json\n(schema evolution in progress)"]
+        MAIN -.->|"branched from"| DEV
+    end
+
+    subgraph MINIO_STORE["MinIO (object storage)"]
+        direction TB
+        V3["v3.metadata.json\n(current on main)"]
+        V4["v4.metadata.json\n(current on dev)"]
+        MAN["manifests + parquet\n(shared between branches\nwhere data is unchanged)"]
+        V3 --- MAN
+        V4 --- MAN
+    end
+
+    NESSIE_STORE -->|"metadataLocation pointer\n(Nessie only stores the path,\nnever the file content)"| MINIO_STORE
+    </div>
+  </div>
+
+  <table>
+    <tr><th>Operation</th><th>Nessie does</th><th>MinIO does</th></tr>
+    <tr><td><code>CREATE TABLE</code></td><td>Records new entry: <code>gold.orders → v1.metadata.json</code></td><td>Stores the actual <code>v1.metadata.json</code> file</td></tr>
+    <tr><td><code>INSERT / APPEND</code></td><td>Updates pointer: <code>gold.orders → v2.metadata.json</code> (atomic CAS)</td><td>Stores new manifest + parquet files; <code>v2.metadata.json</code></td></tr>
+    <tr><td><code>loadTable()</code></td><td>Returns current <code>metadataLocation</code> string</td><td>Nothing — Spark fetches the metadata file directly</td></tr>
+    <tr><td><code>CREATE BRANCH dev</code></td><td>Creates a new ref pointing to same commit as <code>main</code></td><td>Nothing — branches are free, no data copy</td></tr>
+    <tr><td><code>MERGE dev → main</code></td><td>Updates main's commit atomically</td><td>Nothing</td></tr>
+  </table>
+
+  <div class="callout">
+    <strong>Optimistic concurrency:</strong> Nessie's <code>commitTable</code> uses a
+    compare-and-swap on the commit hash. If two writers race, the second writer gets a
+    <code>409 Conflict</code> and must retry (re-read, re-apply, re-commit). This is how Iceberg
+    achieves snapshot isolation without locks.
+  </div>
+
+
+  <!-- ════════════════════════════════════════════════════════════════ -->
+  <h2 id="oauth">4. OAuth2 token flow — issuing and validating JWTs</h2>
+
+  <p>
+    The oauth-service is a full <strong>OAuth 2.0 Authorization Server</strong> implementing
+    RFC 6749 client credentials grant and RFC 7517 JWKS. Nessie acts as a
+    <strong>Resource Server</strong> — it never issues tokens, only validates them.
+  </p>
+
+  <div class="diagram-card">
+    <div class="mermaid">
+sequenceDiagram
+    participant C  as Client<br/>(Spark / CLI)
+    participant AS as oauth-service :8081<br/>(Authorization Server)
+    participant NS as Nessie :19120<br/>(Resource Server)
+    participant PG as PostgreSQL
+
+    Note over AS: On startup: generate RSA-2048 keypair<br/>Store private key in oauth.key_store table
+
+    C  ->>+ AS: POST /token<br/>grant_type=client_credentials<br/>client_id=analytics-client<br/>client_secret=analytics-secret
+    AS ->>  PG: SELECT hashed_secret WHERE client_id=analytics-client
+    PG -->> AS: bcrypt hash
+    AS ->>  AS: bcrypt.verify(secret, hash) -- valid
+    AS ->>  AS: Sign JWT with RS256 private key<br/>iss · sub · aud:nessie-server<br/>scope:catalog:read · exp:now+3600
+    AS -->>-C: access_token: eyJ... · expires_in: 3600
+
+    Note over NS: On first request: fetch OIDC config + JWKS
+
+    NS ->>+ AS: GET /.well-known/openid-configuration
+    AS -->>-NS: { issuer, jwks_uri, token_endpoint, ... }
+    NS ->>+ AS: GET /.well-known/jwks.json
+    AS -->>-NS: { keys: [{ kty:RSA, kid, n, e, alg:RS256 }] }
+    Note over NS: Cache public key — re-fetch on kid mismatch
+
+    C  ->>+ NS: GET /api/v2/trees/main<br/>Authorization: Bearer eyJ...
+    NS ->>  NS: Decode JWT header → kid<br/>Look up cached public key<br/>RS256.verify(token, pubkey)<br/>Check exp, iss, aud
+    NS -->>-C: 200 OK { reference: { name: main, ... } }
+
+    C  ->>+ NS: POST /api/v2/trees/main/contents<br/>(commitTable — register metadata pointer)
+    NS ->>  NS: Verify JWT · check scope catalog:write
+    NS ->>  PG: INSERT commit record (CAS on hash)
+    NS -->>-C: 200 OK { targetHash: abc123 }
+    </div>
+  </div>
+
+  <div class="callout green">
+    <strong>The private key never leaves the oauth-service container.</strong>
+    Nessie only ever sees the public key (via JWKS). Even if Nessie's PostgreSQL database were
+    compromised, an attacker could not forge new tokens — they would need the RSA private key
+    stored in the oauth-service's database.
+  </div>
+
+
+  <!-- ════════════════════════════════════════════════════════════════ -->
+  <h2 id="spark-bearer">5. BEARER approach — why it breaks at token expiry</h2>
+
+  <div class="compare">
+    <div class="compare-box bad">
+      <h4 class="bad">BEARER (static token)</h4>
+      <ul>
+        <li>Fetch token manually with <code>requests.post()</code></li>
+        <li>Pass it via <code>spark.conf.set("…authentication.token", token)</code></li>
+        <li>Token expires in 3600 s → gateway starts returning 401</li>
+        <li>Switching principals = call <code>spark.conf.set()</code> again,
+            but the already-initialized RESTCatalog instance has cached
+            the old identity — requests may still use the old token</li>
+        <li>Long-running jobs silently fail mid-job when the token expires</li>
+      </ul>
+    </div>
+    <div class="compare-box good">
+      <h4 class="good">OAUTH2 (Iceberg RESTCatalog manages tokens)</h4>
+      <ul>
+        <li>Configure <code>credential = client_id:client_secret</code> + <code>oauth2-server-uri</code> in catalog config</li>
+        <li>RESTCatalog fetches token on first catalog call via client_credentials grant</li>
+        <li>Checks expiry before every API call — refreshes automatically when <code>exp - now &lt; buffer</code></li>
+        <li>Per-principal identity = one named catalog per identity,
+            each isolated with its own token lifecycle</li>
+        <li>Long-running jobs just work — refresh is transparent</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="diagram-card">
+    <div class="mermaid">
+sequenceDiagram
+    participant APP  as Spark app
+    participant CAT  as RESTCatalog instance<br/>(gw_analytics → catalog-gateway:8083)
+    participant AS   as oauth-service :8081
+    participant GW   as catalog-gateway :8083
+
+    Note over CAT: credential=analytics-client:analytics-secret<br/>oauth2-server-uri=.../token
+
+    APP  ->> CAT: spark.read.load(gw_analytics.gold.orders)
+    CAT  ->> CAT: token cache empty?
+    CAT  ->>+ AS: POST /token (client_credentials)
+    AS  -->>-CAT: JWT exp:now+3600
+    CAT  ->> CAT: cache token + expiry
+    CAT  ->>+ GW: GET /v1/namespaces/gold/tables/orders<br/>Authorization: Bearer eyJ... [fresh]
+    GW  -->>-CAT: table metadata (schema rewritten, masks set)
+    CAT -->> APP: table metadata
+
+    Note over APP: 55 minutes later...
+
+    APP  ->> CAT: spark.read.load(gw_analytics.gold.orders)
+    CAT  ->> CAT: token expires in 5 min -- refresh now
+    CAT  ->>+ AS: POST /token (client_credentials)
+    AS  -->>-CAT: new JWT exp:now+3600
+    CAT  ->>+ GW: GET /v1/namespaces/gold/tables/orders<br/>Authorization: Bearer eyJ... [refreshed]
+    GW  -->>-CAT: table metadata (schema rewritten, masks set)
+    CAT -->> APP: table metadata
+    </div>
+  </div>
+
+
+  <!-- ════════════════════════════════════════════════════════════════ -->
+  <h2 id="spark-oauth2">6. Spark RESTCatalog — catalog-per-principal via gateway</h2>
+
+  <p>
+    Each named catalog in the SparkSession is an independent Iceberg <code>RESTCatalog</code>
+    instance with its own OAuth2 credentials. All traffic goes through <strong>catalog-gateway:8083</strong>
+    — not directly to Nessie. The gateway validates the JWT, enforces OPA policy, and forwards
+    using its own admin token. Enforcement is transparent to Spark.
+  </p>
+
+  <div class="diagram-card">
+    <div class="mermaid">
+flowchart TD
+    subgraph SS["SparkSession"]
+        direction TB
+        subgraph CA["gw_admin catalog"]
+            CA1["RESTCatalog\ntype: rest · uri: :8083\ncredential: admin-client:admin-secret\ntoken: [Iceberg client manages]"]
+        end
+        subgraph CB["gw_analytics catalog"]
+            CB1["RESTCatalog\ntype: rest · uri: :8083\ncredential: analytics-client:analytics-secret\ntoken: [Iceberg client manages]"]
+        end
+        subgraph CC["gw_ds catalog"]
+            CC1["RESTCatalog\ntype: rest · uri: :8083\ncredential: data-scientist:ds-secret\ntoken: [Iceberg client manages]"]
+        end
+    end
+
+    OAUTH["oauth-service :8081\n/token endpoint"]
+    GW["catalog-gateway :8083\nOPA enforce → forward to Nessie"]
+
+    CA1 -->|"POST /token (credential)"| OAUTH
+    CB1 -->|"POST /token (credential)"| OAUTH
+    CC1 -->|"POST /token (credential)"| OAUTH
+
+    CA1 -->|"Bearer JWT (admin) — all allowed"| GW
+    CB1 -->|"Bearer JWT (analytics)\n→ schema rewrite + scan filter"| GW
+    CC1 -->|"Bearer JWT (ds)\n→ 403 on gold"| GW
+
+    style SS fill:#1a1d27,stroke:#a78bfa
+    style CA fill:#1a2540,stroke:#3b82f6
+    style CB fill:#2d2a1a,stroke:#ca8a04
+    style CC fill:#2d1a2d,stroke:#a78bfa
+    </div>
+  </div>
+
+  <h3>Spark config keys for RESTCatalog (via gateway)</h3>
+  <table>
+    <tr><th>Config key (prefix: <code>spark.sql.catalog.&lt;name&gt;</code>)</th><th>Value</th><th>Notes</th></tr>
+    <tr><td>.type</td><td><code>rest</code></td><td>Standard Iceberg RESTCatalog — no Nessie-specific JAR needed</td></tr>
+    <tr><td>.uri</td><td><code>http://localhost:8083</code></td><td>Catalog gateway — sole client entry point. Never connect directly to Nessie :19120</td></tr>
+    <tr><td>.credential</td><td><code>analytics-client:analytics-secret</code></td><td>Triggers client_credentials grant. Iceberg RESTCatalog fetches + refreshes token automatically</td></tr>
+    <tr><td>.oauth2-server-uri</td><td><code>http://localhost:8081/token</code></td><td>Token endpoint used with <code>.credential</code></td></tr>
+    <tr><td>.warehouse</td><td><code>s3a://warehouse/</code></td><td>Root path for new table data in MinIO</td></tr>
+  </table>
+
+  <div class="callout green">
+    <strong>No Nessie JARs required.</strong> The Iceberg RESTCatalog is built into
+    <code>iceberg-spark-runtime-3.5_2.12:1.9.1</code>. There is no
+    <code>nessie-spark-extensions</code> dependency.
+    Iceberg format-version=2 tables with <code>PARTITIONED BY</code> are supported out of the box.
+  </div>
+
+
+  <!-- ════════════════════════════════════════════════════════════════ -->
+  <h2 id="query-lifecycle">7. Full query lifecycle — gateway-enforced read</h2>
+
+  <p>
+    Putting it all together: what happens between
+    <code>spark.table("gw_analytics.gold.orders")</code>
+    and the enforced DataFrame appearing in your application.
+    No application-level filter calls — the gateway enforces transparently.
+  </p>
+
+  <div class="diagram-card">
+    <div class="mermaid">
+sequenceDiagram
+    participant APP  as Application code
+    participant CAT  as gw_analytics<br/>RESTCatalog
+    participant AS   as oauth-service :8081
+    participant GW   as catalog-gateway :8083
+    participant OPA  as opa :8181
+    participant NS   as Nessie :19120
+    participant MIO  as MinIO :9000
+
+    APP  ->>+ CAT: spark.table(gw_analytics.gold.orders)
+    CAT  ->>+ AS: POST /token (credential, if cache empty)
+    AS  -->>-CAT: JWT sub:analytics-client exp:now+3600
+
+    CAT  ->>+ GW: GET /v1/namespaces/gold/tables/orders<br/>Authorization: Bearer eyJ[analytics]
+    GW   ->>  GW: validate JWT → principal=analytics-client
+    GW   ->>+ OPA: POST /v1/data/iceberg/policy<br/>{principal, namespace:gold, table:orders, op:READ}
+    OPA -->>-GW: allow:true · excl:[ssn,credit_card_number]<br/>row_filter:null · masks:{customer_email...}
+    GW   ->>+ NS: GET /iceberg/v1/namespaces/gold/tables/orders<br/>Authorization: Bearer eyJ[admin]
+    NS  -->>-GW: table metadata (full schema)
+    GW   ->>  GW: strip ssn + credit_card_number from schema (Layer 4)
+    GW   ->>  GW: embed column_masks as table property (Layer 3)
+    GW  -->>-CAT: table metadata — schema WITHOUT ssn/credit_card_number
+
+    CAT ->>+ MIO: GET metadata.json → snap.avro → manifests
+    MIO -->>-CAT: partition summaries (EMEA, APAC, AMER)
+
+    CAT  ->>+ GW: POST /v1/namespaces/gold/tables/orders/scan<br/>Authorization: Bearer eyJ[analytics] · filter: (none)
+    GW   ->>+ OPA: POST /v1/data/iceberg/policy (SCAN)
+    OPA -->>-GW: row_filter: "region = 'EMEA'"
+    GW   ->>  GW: merge → filter:{type:eq,term:region,value:EMEA} (Layer 2)
+    GW   ->>+ NS: POST /iceberg/v1/…/scan  filter:{eq,region,EMEA}<br/>Authorization: Bearer eyJ[admin]
+    NS  -->>-GW: scan tasks — EMEA partition files only (file pruning)
+    GW  -->>-CAT: scan tasks
+
+    CAT ->>+ MIO: fetch EMEA Parquet files only
+    MIO -->>-CAT: 2 rows (EMEA only)
+    CAT -->>-APP: DataFrame — 2 rows, no ssn column, no credit_card_number column
+    Note over APP: No df.filter() · No df.drop() · No df.withColumn() needed
+    </div>
+  </div>
+
+  <div class="callout green">
+    <strong>Infrastructure-enforced, not advisory.</strong>
+    The gateway injects the scan filter expression before Nessie responds — Nessie returns
+    only EMEA partition files (file-level pruning). Spark never receives a schema with
+    <code>ssn</code> or <code>credit_card_number</code>, so it cannot project or request
+    those columns. No application cooperation required.
+  </div>
+
+
+  <!-- ════════════════════════════════════════════════════════════════ -->
+  <h2 id="engines">8. Other query engines — Trino, Flink, PyIceberg, DuckDB</h2>
+
+  <p>
+    Every engine connects to <strong>catalog-gateway:8083</strong> (Iceberg REST Catalog protocol).
+    The gateway enforces OPA policy for all engines — no engine-specific policy integration needed.
+    All engines authenticate with the same OAuth2 client credentials flow.
+  </p>
+
+  <div class="diagram-card">
+    <div class="mermaid">
+flowchart LR
+    subgraph ENGINES["Query engines"]
+        SPARK["PySpark 3.5\niceberg-spark-runtime JAR\nRESTCatalog · credential config"]
+        TRINO["Trino\niceberg connector\nREST catalog type\nBearer JWT"]
+        FLINK["Flink\niceberg-flink JAR\nRESTCatalog config"]
+        PYICE["PyIceberg (Python)\nRESTCatalog via catalog.yaml\nBearer JWT"]
+        DUCK["DuckDB / pandas\nvia PyIceberg REST"]
+    end
+
+    subgraph GW_API["catalog-gateway :8083\n(Iceberg REST Catalog v1)"]
+        EP1["/v1/namespaces/{ns}/tables/{t}\nGET → schema rewrite (Layer 4)"]
+        EP2["/v1/namespaces/{ns}/tables/{t}/scan\nPOST → scan filter injection (Layer 2)"]
+        EP3["Other paths → proxy to Nessie"]
+    end
+
+    SPARK  -->|"credential=client_id:secret\nREST protocol"| GW_API
+    TRINO  -->|"Bearer JWT"| GW_API
+    FLINK  -->|"Bearer JWT"| GW_API
+    PYICE  -->|"Bearer JWT"| GW_API
+    DUCK   -->|"via PyIceberg"| GW_API
+
+    GW_API --> MINIO["MinIO / S3 / ADLS / GCS\nActual Parquet + metadata files\n(engines read directly from storage)"]
+
+    style ENGINES fill:#1a1d27,stroke:#a78bfa
+    style GW_API fill:#2d2a1a,stroke:#ca8a04
+    </div>
+  </div>
+
+  <table>
+    <tr>
+      <th>Engine</th>
+      <th>Catalog JAR / package</th>
+      <th>Connect to</th>
+      <th>Auth</th>
+    </tr>
+    <tr>
+      <td>PySpark 3.5</td>
+      <td><code>iceberg-spark-runtime-3.5_2.12:1.9.1</code></td>
+      <td><code>type=rest · uri=http://localhost:8083</code></td>
+      <td><code>credential=client_id:secret</code> — Iceberg client auto-manages token</td>
+    </tr>
+    <tr>
+      <td>Trino</td>
+      <td>Iceberg connector built-in</td>
+      <td><code>iceberg.rest-catalog.uri=http://localhost:8083</code></td>
+      <td>Bearer JWT via <code>iceberg.rest-catalog.security</code></td>
+    </tr>
+    <tr>
+      <td>Apache Flink</td>
+      <td><code>iceberg-flink-runtime</code></td>
+      <td><code>catalog-type=rest · uri=http://localhost:8083</code></td>
+      <td>Bearer JWT or credential</td>
+    </tr>
+    <tr>
+      <td>PyIceberg</td>
+      <td><code>pip install pyiceberg</code></td>
+      <td><code>type=rest · uri=http://localhost:8083</code> in <code>~/.pyiceberg.yaml</code></td>
+      <td><code>token: &lt;JWT&gt;</code> — fetch via <code>requests.post(/token)</code></td>
+    </tr>
+    <tr>
+      <td>DuckDB / pandas</td>
+      <td>Via PyIceberg: <code>scan.to_arrow()</code></td>
+      <td>Same as PyIceberg</td>
+      <td>Same as PyIceberg</td>
+    </tr>
+  </table>
+
+  <h3>PyIceberg example (no JVM)</h3>
+  <p>
+    PyIceberg uses the standard Iceberg REST Catalog client. Auth is a plain Bearer token
+    fetched manually. The gateway enforces OPA policy transparently.
+  </p>
+
+  <div class="diagram-card">
+    <div class="mermaid">
+sequenceDiagram
+    participant PY   as Python app
+    participant AS   as oauth-service :8081
+    participant GW   as catalog-gateway :8083
+    participant MIO  as MinIO :9000
+
+    PY  ->>+ AS: POST /token (requests.post)
+    AS -->>-PY: JWT sub:analytics-client
+
+    Note over PY: from pyiceberg.catalog.rest import RestCatalog<br/>catalog = RestCatalog('gw',<br/>  uri='http://localhost:8083',<br/>  token=jwt,<br/>  warehouse='s3a://warehouse/')
+
+    PY  ->>+ GW: GET /v1/namespaces/gold/tables/orders<br/>Authorization: Bearer eyJ...
+    Note over GW: OPA: allow=true · excl=[ssn,credit_card_number]
+    GW -->>-PY: schema WITHOUT ssn / credit_card_number
+
+    PY  ->>+ GW: POST /v1/namespaces/gold/tables/orders/scan
+    Note over GW: OPA: row_filter='region=EMEA'<br/>inject eq(region,EMEA) into scan
+    GW -->>-PY: scan tasks — EMEA files only
+
+    PY  ->>+ MIO: fetch EMEA Parquet files only
+    MIO -->>-PY: Arrow RecordBatches (2 rows, no PII columns)
+
+    PY  ->>  PY: df = scan.to_arrow().to_pandas()
+    Note over PY: No manual .filter() or column drop needed
+    </div>
+  </div>
+
+
+  <!-- ════════════════════════════════════════════════════════════════ -->
+  <h2 id="policy">9. OPA policy enforcement — infrastructure-level</h2>
+
+  <p>
+    The <strong>catalog-gateway</strong> is an enforcing proxy, not an advisory sidecar.
+    All Iceberg REST traffic passes through it. OPA evaluates every request.
+    Nessie port 19120 is not exposed to the host — bypassing the gateway is a network-level
+    impossibility, not an application convention.
+  </p>
+
+  <div class="diagram-card">
+    <div class="mermaid">
+flowchart TD
+    CLIENT["Client (Spark / Trino / PyIceberg)\nBearer JWT — principal extracted by gateway"]
+
+    subgraph GW["catalog-gateway :8083  —  enforcement point"]
+        GW1["① Validate JWT (PyJWKClient → oauth-service)"]
+        GW2["② OPA decision\nPOST /v1/data/iceberg/policy\n{principal, namespace, table, operation}"]
+        GW3["③ allow=false → HTTP 403  (Layer 1)"]
+        GW4["④ Schema rewrite\nstrip excluded_columns  (Layer 4, hard)"]
+        GW5["⑤ Scan filter inject\nmerge row_filter into scan expr  (Layer 2, hard)"]
+        GW6["⑥ Embed column_masks\nas table property  (Layer 3, advisory)"]
+        GW7["⑦ Forward to Nessie\nwith admin token"]
+    end
+
+    OPA["opa :8181\n─────────────────────────\nPackage: iceberg\nReturns: allow · excluded_columns\n  row_filter · column_masks\nHot-reloads from /policies volume"]
+
+    NS["Nessie :19120\n─────────────────────────\nNOT host-exposed\nValidates admin JWT only\nDoes NOT know about client principals"]
+
+    MIO["MinIO :9000\n─────────────────────────\nServes raw bytes\nNo access control knowledge"]
+
+    CLIENT -->|"Iceberg REST"| GW1
+    GW1 --> GW2
+    GW2 -->|"OPA query"| OPA
+    OPA -->|"decision"| GW2
+    GW2 --> GW3
+    GW3 -->|"allowed"| GW4
+    GW4 --> GW5
+    GW5 --> GW6
+    GW6 --> GW7
+    GW7 -->|"admin Bearer JWT"| NS
+    NS -->|"metadata"| GW7
+    CLIENT -->|"S3A — read Parquet\n(direct, after scan planning)"| MIO
+
+    style GW fill:#2d2a1a,stroke:#ca8a04
+    style OPA fill:#1a2d1a,stroke:#22c55e
+    style NS  fill:#1a2540,stroke:#3b82f6
+    style MIO fill:#1f1f2e,stroke:#6b7280
+    </div>
+  </div>
+
+  <table>
+    <tr><th>Layer</th><th>Type</th><th>Mechanism</th><th>Can client bypass?</th></tr>
+    <tr><td>1 — Table access</td><td><strong style="color:var(--red)">Hard</strong></td><td>OPA <code>allow=false</code> → gateway returns HTTP 403</td><td>No — on the network path</td></tr>
+    <tr><td>2 — Row filter</td><td><strong style="color:var(--red)">Hard</strong></td><td>Gateway injects Iceberg scan filter expression → Nessie prunes at file level</td><td>No — scan filter is in the catalog protocol</td></tr>
+    <tr><td>3 — Column masking</td><td><strong style="color:var(--amber)">Advisory</strong></td><td>Stored as <code>gateway.column-masks</code> table property</td><td>Yes — query engine must apply it</td></tr>
+    <tr><td>4 — Column exclusion</td><td><strong style="color:var(--red)">Hard</strong></td><td>Gateway strips excluded columns from schema response</td><td>No — Spark can't project columns it doesn't see in the schema</td></tr>
+  </table>
+
+  <div class="callout green">
+    <strong>OPA is the single source of truth for all access decisions.</strong>
+    Edit <code>opa/policies/iceberg.rego</code> and OPA hot-reloads the change within seconds.
+    No container restarts. No redeploy. The gateway picks up the new policy on the next request.
+    See <a href="opa-policies.md">docs/opa-policies.md</a> for the policy guide.
+  </div>
+
+  <hr />
+
+  <p style="font-size:0.82rem; color:var(--muted); text-align:center;">
+    catalog-sync · iceberg-catalog-auth.html ·
+    <a href="opa-policies.md">opa-policies.md</a> ·
+    <a href="nessie-setup.md">nessie-setup.md</a> ·
+    <a href="oauth-setup.md">oauth-setup.md</a>
+  </p>
+
+</div>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'dark',
+    themeVariables: {
+      primaryColor:       '#1e3a5f',
+      primaryTextColor:   '#e2e8f0',
+      primaryBorderColor: '#3b82f6',
+      lineColor:          '#4b5563',
+      secondaryColor:     '#1a2d1a',
+      tertiaryColor:      '#2d2a1a',
+      background:         '#1a1d27',
+      mainBkg:            '#1a1d27',
+      nodeBorder:         '#4b5563',
+      clusterBkg:         '#1f2335',
+      titleColor:         '#93c5fd',
+      edgeLabelBackground:'#1a1d27',
+      fontSize:           '13px',
+    },
+    flowchart: { curve: 'basis', padding: 20 },
+    sequence:  { mirrorActors: false, messageAlign: 'center', wrap: true, width: 180 },
+  });
+</script>
+</body>
+</html>

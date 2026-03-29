@@ -1,0 +1,182 @@
+# Default data contracts for catalog-sync
+#
+# Four-layer access control model:
+#   Layer 1 (coarse) — principals × namespaces × tables × operations  → allow / deny
+#   Layer 2 (RLS)    — row_filters:         SQL WHERE predicates (OR-combined)
+#   Layer 3 (CLS)    — column_masks:        PII masking SQL expressions
+#   Layer 4 (CLS)    — column_exclusions:   columns hidden entirely from projection
+#
+# Wildcard "*" is supported in principals, namespaces, tables, and row_filter.table /
+# column_mask.table / column_exclusion.table fields (fnmatch patterns).
+#
+# Evaluation rules:
+#   Access decision: first matching contract wins (allow)
+#   Row filters:     OR-combined across all matching contracts
+#   Column masks:    first matching contract per column wins
+#   Column exclusions: union across all matching contracts; overrides masks
+
+version: "1.0"
+contracts:
+
+  # ── Admin: unrestricted access, no RLS/CLS ───────────────────────────────
+  - id: "admin-full-access"
+    name: "Admin Full Access"
+    description: >
+      Admin client has unrestricted access to all catalog resources.
+      No row filters or column restrictions — sees raw data in full.
+    principals:
+      - "admin-client"
+    namespaces:
+      - "*"
+    tables:
+      - "*"
+    operations:
+      - "read"
+      - "write"
+      - "drop"
+      - "admin"
+    row_filters: []
+    column_masks: []
+    column_exclusions: []
+    enabled: true
+
+  # ── Sync service: read+write everywhere, no RLS/CLS ─────────────────────
+  - id: "sync-service-write"
+    name: "Sync Service Write Access"
+    description: >
+      Sync service can read and register tables in any namespace.
+      No row or column restrictions — needs full data fidelity for accurate replication.
+    principals:
+      - "sync-service"
+    namespaces:
+      - "*"
+    tables:
+      - "*"
+    operations:
+      - "read"
+      - "write"
+    row_filters: []
+    column_masks: []
+    column_exclusions: []
+    enabled: true
+
+  # ── Analytics client: gold namespace, EMEA region only, PII masked ───────
+  - id: "analytics-gold-read"
+    name: "Analytics Gold Layer Read (EMEA, PII masked)"
+    description: >
+      Analytics team can read gold namespace tables, but only rows from the EMEA
+      region. PII columns (email, phone) are masked. Highly sensitive fields
+      (ssn, credit_card_number, date_of_birth) are completely excluded.
+    principals:
+      - "analytics-client"
+    namespaces:
+      - "gold"
+    tables:
+      - "*"
+    operations:
+      - "read"
+
+    # Layer 2: Row-Level Security
+    # Analytics team sees EMEA data only.
+    # iceberg_expression enables file-level pruning via column statistics
+    # (Parquet files outside the predicate range are skipped entirely).
+    row_filters:
+      - table: "orders"
+        filter_expression: "region = 'EMEA'"
+        iceberg_expression:
+          type: eq
+          term: region
+          value: EMEA
+      - table: "customers"
+        filter_expression: "country IN ('GB', 'DE', 'FR', 'NL', 'SE', 'NO', 'DK')"
+        iceberg_expression:
+          type: in
+          term: country
+          values: [GB, DE, FR, NL, SE, NO, DK]
+      - table: "transactions"
+        filter_expression: "region = 'EMEA' AND status = 'COMPLETED'"
+        iceberg_expression:
+          type: and
+          left:
+            type: eq
+            term: region
+            value: EMEA
+          right:
+            type: eq
+            term: status
+            value: COMPLETED
+
+    # Layer 3: Column-Level Security — masking (PII obfuscation)
+    column_masks:
+      - table: "customers"
+        column: "email"
+        mask_expression: "CONCAT(LEFT(email, 2), '****@****.com')"
+      - table: "customers"
+        column: "phone"
+        mask_expression: "'***-***-****'"
+      - table: "orders"
+        column: "customer_email"
+        mask_expression: "CONCAT(LEFT(customer_email, 2), '****@****.com')"
+      - table: "*"
+        column: "ip_address"
+        mask_expression: "CONCAT(SPLIT_PART(ip_address, '.', 1), '.***.***.***')"
+
+    # Layer 4: Column-Level Security — exclusions (completely hidden)
+    column_exclusions:
+      - table: "customers"
+        columns:
+          - "ssn"
+          - "credit_card_number"
+          - "date_of_birth"
+          - "passport_number"
+      - table: "transactions"
+        columns:
+          - "raw_card_data"
+          - "bank_account_number"
+
+    enabled: true
+
+  # ── Data scientist: silver + bronze, full table access but PII excluded ──
+  - id: "data-scientist-silver-bronze-read"
+    name: "Data Scientist Silver and Bronze Read (PII excluded)"
+    description: >
+      Data scientists can read silver and bronze layers. No row-level restrictions
+      (they need full data for model training), but PII columns are excluded entirely
+      — anonymised datasets only.
+    principals:
+      - "data-scientist"
+    namespaces:
+      - "silver"
+      - "bronze"
+    tables:
+      - "*"
+    operations:
+      - "read"
+
+    # Layer 2: Row-Level Security — no row filters (full row access)
+    row_filters: []
+
+    # Layer 3: Column masks — partial masking on indirect identifiers
+    column_masks:
+      - table: "*"
+        column: "postal_code"
+        mask_expression: "LEFT(postal_code, 3) || '***'"
+      - table: "*"
+        column: "ip_address"
+        mask_expression: "CONCAT(SPLIT_PART(ip_address, '.', 1), '.0.0.0')"
+
+    # Layer 4: Column exclusions — all direct PII removed
+    column_exclusions:
+      - table: "*"
+        columns:
+          - "email"
+          - "phone"
+          - "ssn"
+          - "full_name"
+          - "date_of_birth"
+          - "passport_number"
+          - "credit_card_number"
+          - "bank_account_number"
+          - "national_id"
+
+    enabled: true

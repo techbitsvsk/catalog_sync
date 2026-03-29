@@ -93,6 +93,20 @@ def _common_options(fn):
                       "When provided, registers / updates the table in Nessie after file sync.")(fn)
     fn = click.option("--nessie-ref", default="main", show_default=True, help="Nessie branch name")(fn)
     fn = click.option("--nessie-token", default=None, help="Bearer token for secured Nessie")(fn)
+    # OAuth options (for enterprise deployments with token-secured Nessie)
+    fn = click.option("--oauth-url", default=None, envvar="OAUTH_URL",
+                      help="OAuth service URL. When provided with --oauth-client-id and "
+                           "--oauth-client-secret, tokens are automatically fetched for Nessie.")(fn)
+    fn = click.option("--oauth-client-id", default=None, envvar="OAUTH_CLIENT_ID",
+                      help="OAuth client ID")(fn)
+    fn = click.option("--oauth-client-secret", default=None, envvar="OAUTH_CLIENT_SECRET",
+                      help="OAuth client secret")(fn)
+    fn = click.option("--oauth-scope", default="catalog:read catalog:write", show_default=True,
+                      help="OAuth scopes to request")(fn)
+    # Policy enforcement
+    fn = click.option("--policy-url", default=None, envvar="POLICY_URL",
+                      help="Policy service URL. When provided, data contract policies are "
+                           "enforced before catalog operations.")(fn)
     # Optional metadata location override — bypasses filesystem discovery
     fn = click.option(
         "--metadata-location", default=None,
@@ -106,6 +120,45 @@ def _common_options(fn):
     return fn
 
 
+def _build_oauth_and_policy(kwargs: dict):
+    """
+    Extract OAuth/policy options from kwargs and return (oauth_client, policy_client).
+
+    Both may be None if the corresponding options were not provided.
+    """
+    oauth_url = kwargs.pop("oauth_url", None)
+    oauth_client_id = kwargs.pop("oauth_client_id", None)
+    oauth_client_secret = kwargs.pop("oauth_client_secret", None)
+    oauth_scope = kwargs.pop("oauth_scope", "catalog:read catalog:write")
+    policy_url = kwargs.pop("policy_url", None)
+
+    oauth_client = None
+    if oauth_url and oauth_client_id and oauth_client_secret:
+        from iceberg_sync.auth.oauth_client import OAuthClient
+        oauth_client = OAuthClient(
+            server_url=oauth_url,
+            client_id=oauth_client_id,
+            client_secret=oauth_client_secret,
+            scope=oauth_scope,
+        )
+
+    policy_client = None
+    if policy_url and oauth_client:
+        from iceberg_sync.auth.policy_client import PolicyClient
+        policy_client = PolicyClient(
+            service_url=policy_url,
+            principal=oauth_client.client_id,
+        )
+    elif policy_url and oauth_client_id:
+        from iceberg_sync.auth.policy_client import PolicyClient
+        policy_client = PolicyClient(
+            service_url=policy_url,
+            principal=oauth_client_id,
+        )
+
+    return oauth_client, policy_client
+
+
 def _register_in_nessie(
     nessie_uri: str,
     nessie_ref: str,
@@ -113,11 +166,19 @@ def _register_in_nessie(
     namespace: str,
     table: str,
     metadata_location: str,
+    oauth_client=None,
+    policy_client=None,
 ) -> None:
     """Register or update a table in Nessie after file sync."""
     from iceberg_sync.catalog.nessie import NessieCatalog
 
-    nessie = NessieCatalog(uri=nessie_uri, ref=nessie_ref, token=nessie_token)
+    nessie = NessieCatalog(
+        uri=nessie_uri,
+        ref=nessie_ref,
+        token=nessie_token,
+        oauth_client=oauth_client,
+        policy_client=policy_client,
+    )
     if not nessie.ping():
         raise RuntimeError(f"Cannot reach Nessie at {nessie_uri} — is the server running?")
 
@@ -203,6 +264,7 @@ def _build_sync(
 def table(table, source_root, target_root, dry_run, nessie_uri, nessie_ref, nessie_token,
           metadata_location, **kwargs):
     """Sync a single Iceberg table, then optionally register in Nessie."""
+    oauth_client, policy_client = _build_oauth_and_policy(kwargs)
     sync = _build_sync(source_root=source_root, target_root=target_root, nessie_uri=nessie_uri, **kwargs)
     table_root = source_root.rstrip("/") + "/" + table.strip("/") + "/"
 
@@ -211,6 +273,8 @@ def table(table, source_root, target_root, dry_run, nessie_uri, nessie_ref, ness
         console.print("[yellow]DRY RUN — no changes will be made[/yellow]\n")
     if nessie_uri:
         console.print(f"[dim]Nessie catalog:[/dim] {nessie_uri}  (ref: {nessie_ref})\n")
+    if oauth_client:
+        console.print(f"[dim]OAuth client:[/dim] {oauth_client.client_id}\n")
 
     if metadata_location:
         console.print(f"[dim]Metadata location:[/dim] {metadata_location} (discovery skipped)\n")
@@ -232,6 +296,8 @@ def table(table, source_root, target_root, dry_run, nessie_uri, nessie_ref, ness
                 namespace=ns,
                 table=tbl_name,
                 metadata_location=result.target_metadata_uri,
+                oauth_client=oauth_client,
+                policy_client=policy_client,
             )
         except Exception as e:
             console.print(f"  [red]Nessie registration failed: {e}[/red]")
@@ -245,6 +311,7 @@ def table(table, source_root, target_root, dry_run, nessie_uri, nessie_ref, ness
 @_common_options
 def namespace(namespace, source_root, target_root, dry_run, nessie_uri, nessie_ref, nessie_token, **kwargs):
     """Sync all tables in an Iceberg namespace, then optionally register in Nessie."""
+    oauth_client, policy_client = _build_oauth_and_policy(kwargs)
     sync = _build_sync(source_root=source_root, target_root=target_root, nessie_uri=nessie_uri, **kwargs)
     ns_root = source_root.rstrip("/") + "/" + namespace.strip("/") + "/"
 
@@ -253,6 +320,8 @@ def namespace(namespace, source_root, target_root, dry_run, nessie_uri, nessie_r
         console.print("[yellow]DRY RUN — no changes will be made[/yellow]\n")
     if nessie_uri:
         console.print(f"[dim]Nessie catalog:[/dim] {nessie_uri}  (ref: {nessie_ref})\n")
+    if oauth_client:
+        console.print(f"[dim]OAuth client:[/dim] {oauth_client.client_id}\n")
 
     results = sync.sync_namespace(ns_root, dry_run=dry_run)
     for r in results:
@@ -276,6 +345,8 @@ def namespace(namespace, source_root, target_root, dry_run, nessie_uri, nessie_r
                     namespace=ns_cat,
                     table=tbl_name,
                     metadata_location=r.target_metadata_uri,
+                    oauth_client=oauth_client,
+                    policy_client=policy_client,
                 )
             except Exception as e:
                 console.print(f"  [red]Nessie registration failed for {tbl_name}: {e}[/red]")

@@ -20,9 +20,26 @@ from typing import Dict, List, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
+from requests.auth import AuthBase
 from urllib3.util.retry import Retry
 
 log = logging.getLogger(__name__)
+
+
+class _OAuthTokenAuth(AuthBase):
+    """
+    Requests auth handler that injects a dynamically fetched OAuth Bearer token.
+
+    The token is retrieved from the OAuthClient on every request so that
+    automatic refresh (before expiry) is transparent to the caller.
+    """
+
+    def __init__(self, oauth_client) -> None:
+        self._oauth_client = oauth_client
+
+    def __call__(self, r: requests.PreparedRequest) -> requests.PreparedRequest:
+        r.headers["Authorization"] = f"Bearer {self._oauth_client.get_token()}"
+        return r
 
 
 class NessieCatalog:
@@ -33,9 +50,14 @@ class NessieCatalog:
     file-level sync has placed Parquet + metadata files on target storage.
 
     Args:
-        uri:   Nessie base URL (e.g. http://localhost:19120)
-        ref:   Nessie branch to commit to (default: "main")
-        token: Bearer token for authenticated Nessie deployments
+        uri:           Nessie base URL (e.g. http://localhost:19120)
+        ref:           Nessie branch to commit to (default: "main")
+        token:         Static Bearer token for authenticated Nessie deployments.
+                       Ignored when oauth_client is provided.
+        oauth_client:  OAuthClient instance for dynamic token fetch. When
+                       provided, tokens are refreshed automatically before expiry.
+        policy_client: PolicyClient instance for data contract enforcement. When
+                       provided, enforce() is called before mutating operations.
 
     Usage:
         nessie = NessieCatalog("http://localhost:19120")
@@ -51,22 +73,32 @@ class NessieCatalog:
         uri: str,
         ref: str = "main",
         token: Optional[str] = None,
+        oauth_client=None,      # OAuthClient instance for dynamic token fetch
+        policy_client=None,     # PolicyClient instance for policy enforcement
         **_kwargs,  # absorb unused kwargs (prefix, warehouse) from old callers
     ):
         self._base = uri.rstrip("/")
         self._ref = ref
-        self._session = self._build_session(token)
+        self._policy_client = policy_client
+        self._session = self._build_session(token, oauth_client)
 
     @staticmethod
-    def _build_session(token: Optional[str]) -> requests.Session:
+    def _build_session(token: Optional[str], oauth_client=None) -> requests.Session:
         session = requests.Session()
         retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 502, 503, 504])
         session.mount("http://", HTTPAdapter(max_retries=retry))
         session.mount("https://", HTTPAdapter(max_retries=retry))
         session.headers.update({"Content-Type": "application/json", "Accept": "application/json"})
-        if token:
+        if oauth_client is not None:
+            session.auth = _OAuthTokenAuth(oauth_client)
+        elif token:
             session.headers["Authorization"] = f"Bearer {token}"
         return session
+
+    def _check_policy(self, namespace: str, table: Optional[str], operation: str) -> None:
+        """Enforce policy if a policy_client is configured."""
+        if self._policy_client:
+            self._policy_client.enforce(namespace=namespace, table=table, operation=operation)
 
     # ── Connectivity ──────────────────────────────────────────────────────────
 
@@ -167,6 +199,7 @@ class NessieCatalog:
 
     def get_metadata_location(self, namespace: str, table: str) -> Optional[str]:
         """Return the current metadata-location registered in Nessie, or None."""
+        self._check_policy(namespace, table, "read")
         r = self._session.get(self._content_url(namespace, table), timeout=15)
         if r.status_code == 404:
             return None
@@ -175,6 +208,7 @@ class NessieCatalog:
 
     def register_table(self, namespace: str, table: str, metadata_location: str) -> Dict:
         """Register a new Iceberg table in Nessie, or update its metadata pointer."""
+        self._check_policy(namespace, table, "write")
         self.ensure_namespace(namespace)
 
         # If the key already exists Nessie requires the existing content ID in
@@ -209,6 +243,7 @@ class NessieCatalog:
 
     def drop_table(self, namespace: str, table: str) -> None:
         """Remove a table's catalog entry from Nessie (data files are NOT deleted)."""
+        self._check_policy(namespace, table, "drop")
         try:
             self._commit(
                 operations=[{
@@ -226,6 +261,7 @@ class NessieCatalog:
 
     def update_table(self, namespace: str, table: str, new_metadata_location: str) -> Dict:
         """Point an existing Nessie table at a new metadata.json."""
+        self._check_policy(namespace, table, "write")
         log.info(f"Updating {namespace}.{table} → {new_metadata_location}")
         previous_location = self.get_metadata_location(namespace, table)
 
@@ -257,6 +293,7 @@ class NessieCatalog:
 
     def list_tables(self, namespace: str) -> List[str]:
         """List all table names in a namespace."""
+        self._check_policy(namespace, None, "read")
         r = self._session.get(f"{self._base}/api/v2/trees/{self._ref}/entries", timeout=15)
         r.raise_for_status()
         ns_elements = namespace.split(".")
