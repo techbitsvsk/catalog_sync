@@ -348,9 +348,9 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    YAML[archive-job.yaml\nor restore-job.yaml] --> EXP[_expand_env\n${VAR} substitution]
+    YAML[archive-job.yaml\nor restore-job.yaml] --> EXP[_expand_env\nENV VAR substitution]
     EXP --> CFG[ArchiveJobConfig\nor RestoreJobConfig\ndataclass]
-    ENV[Environment\nvariables] --> EXP
+    ENV[Environment variables] --> EXP
     CFG --> ARC[IcebergArchiver\nor IcebergRestorer]
     CLI[CLI flags\n--source-root etc.] --> CFG
 ```
