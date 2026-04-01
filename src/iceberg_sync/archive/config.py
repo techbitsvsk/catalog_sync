@@ -14,6 +14,25 @@ from typing import Any, Dict, List, Optional
 import yaml
 
 
+def storage_kwargs_for_uri(uri: str, s3: "S3Config", adls: "ADLSConfig") -> Dict[str, Any]:
+    """
+    Return the correct credential kwargs for the given URI scheme.
+
+    Selects S3 or ADLS credentials based on the URI prefix so that
+    credentials for one backend are never accidentally passed to another.
+    """
+    scheme = uri.split("://")[0].lower()
+    if scheme in ("s3", "s3a", "s3n"):
+        return s3.to_storage_kwargs()
+    if scheme in ("abfss", "abfs"):
+        return adls.to_storage_kwargs()
+    return {}
+
+
+# Shorter alias used inside archiver / restorer
+_storage_kwargs = storage_kwargs_for_uri
+
+
 def _expand_env(value: Any) -> Any:
     """Recursively substitute ${VAR} placeholders with environment variable values."""
     if isinstance(value, str):

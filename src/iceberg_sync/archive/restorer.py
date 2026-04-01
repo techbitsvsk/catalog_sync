@@ -25,7 +25,7 @@ import fastavro
 import orjson
 
 from iceberg_sync.archive.archive_index import ArchiveIndex, ArchivedSnapshotEntry
-from iceberg_sync.archive.config import RestoreJobConfig
+from iceberg_sync.archive.config import RestoreJobConfig, _storage_kwargs
 from iceberg_sync.archive.metadata_editor import (
     splice_manifests,
     write_table_metadata,
@@ -87,11 +87,8 @@ class IcebergRestorer:
 
     @classmethod
     def from_config(cls, cfg: RestoreJobConfig) -> "IcebergRestorer":
-        archive_kwargs = cfg.archive_s3.to_storage_kwargs() or cfg.archive_adls.to_storage_kwargs()
-        target_kwargs = cfg.target_s3.to_storage_kwargs() or cfg.target_adls.to_storage_kwargs()
-
-        archive_storage = create_storage(cfg.archive_root, **archive_kwargs)
-        target_storage = create_storage(cfg.target_root, **target_kwargs)
+        archive_storage = create_storage(cfg.archive_root, **_storage_kwargs(cfg.archive_root, cfg.archive_s3, cfg.archive_adls))
+        target_storage = create_storage(cfg.target_root, **_storage_kwargs(cfg.target_root, cfg.target_s3, cfg.target_adls))
 
         nessie = None
         if cfg.catalog.nessie_uri:
@@ -138,12 +135,7 @@ class IcebergRestorer:
             title=f"Archived snapshots — {self._cfg.table}",
         )
 
-        def _fmt_bytes(n: int) -> str:
-            for unit in ("B", "KB", "MB", "GB", "TB"):
-                if n < 1024:
-                    return f"{n:.1f} {unit}"
-                n //= 1024
-            return f"{n} PB"
+        from iceberg_sync.archive._utils import fmt_bytes as _fmt_bytes
 
         for snap in sorted(index.snapshots, key=lambda s: s.timestamp_ms, reverse=True):
             t.add_row(
@@ -294,7 +286,7 @@ class IcebergRestorer:
         # ── Reconstruct metadata ────────────────────────────────────────────
 
         if plan.mode == "new_table" or (plan.mode == "replace" and plan.is_full_table):
-            new_snap_id = int(time.time() * 1000) % (2**31)
+            new_snap_id = int(time.time() * 1000)   # 64-bit epoch-ms; no modulo
             new_manifest_list_uri = self._copy_manifest_list(
                 archived_metadata=archived_metadata,
                 snapshot_id=plan.snapshot_id,

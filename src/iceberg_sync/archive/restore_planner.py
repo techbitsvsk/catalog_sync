@@ -18,20 +18,13 @@ from rich.panel import Panel
 from rich.table import Table
 from rich import box
 
+from iceberg_sync.archive._utils import fmt_bytes as _fmt_bytes
 from iceberg_sync.archive.partition_scanner import ScannedFile, unique_partitions, total_bytes
 from iceberg_sync.storage.base import StorageBackend
 
 log = logging.getLogger(__name__)
 
 console = Console()
-
-
-def _fmt_bytes(n: int) -> str:
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024:
-            return f"{n:.1f} {unit}"
-        n //= 1024
-    return f"{n:.1f} PB"
 
 
 # ──────────────────────────────────────────────────────────────────────────────

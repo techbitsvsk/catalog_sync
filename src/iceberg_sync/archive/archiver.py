@@ -30,7 +30,7 @@ import fastavro
 import orjson
 
 from iceberg_sync.archive.archive_index import ArchiveIndex, ArchivedSnapshotEntry
-from iceberg_sync.archive.config import ArchiveJobConfig
+from iceberg_sync.archive.config import ArchiveJobConfig, _storage_kwargs
 from iceberg_sync.archive.metadata_editor import expire_snapshots_in_metadata
 from iceberg_sync.archive.partition_scanner import scan_snapshot
 from iceberg_sync.archive.snapshot_manager import (
@@ -90,11 +90,8 @@ class IcebergArchiver:
 
     @classmethod
     def from_config(cls, cfg: ArchiveJobConfig) -> "IcebergArchiver":
-        source_kwargs = cfg.source_s3.to_storage_kwargs() or cfg.source_adls.to_storage_kwargs()
-        archive_kwargs = cfg.archive_s3.to_storage_kwargs() or cfg.archive_adls.to_storage_kwargs()
-
-        source_storage = create_storage(cfg.source_root, **source_kwargs)
-        archive_storage = create_storage(cfg.archive_root, **archive_kwargs)
+        source_storage = create_storage(cfg.source_root, **_storage_kwargs(cfg.source_root, cfg.source_s3, cfg.source_adls))
+        archive_storage = create_storage(cfg.archive_root, **_storage_kwargs(cfg.archive_root, cfg.archive_s3, cfg.archive_adls))
 
         nessie = None
         if cfg.catalog.nessie_uri:
@@ -133,7 +130,7 @@ class IcebergArchiver:
         table_source_root = f"{self._source_root}/{table}"
 
         try:
-            metadata = self._load_metadata(table_source_root)
+            metadata, meta_version = self._load_metadata(table_source_root)
         except Exception as exc:
             result.errors.append(f"Cannot load metadata for {table}: {exc}")
             return result
@@ -162,6 +159,8 @@ class IcebergArchiver:
         )
 
         snapshots_done: List[int] = []
+        # Shared set so files referenced by multiple snapshots are copied only once
+        already_copied: Set[str] = set()
 
         for decision in to_archive:
             snap_id = decision.snapshot_id
@@ -173,6 +172,7 @@ class IcebergArchiver:
                     table=table,
                     snapshot_id=snap_id,
                     dry_run=dry_run,
+                    already_copied=already_copied,
                 )
                 result.files_copied += files_copied
                 result.bytes_copied += bytes_copied
@@ -180,7 +180,6 @@ class IcebergArchiver:
                 snapshots_done.append(snap_id)
 
                 if not dry_run:
-                    # Update archive index
                     snap_raw = next(
                         s for s in metadata.get("snapshots", [])
                         if s.get("snapshot-id") == snap_id
@@ -202,6 +201,16 @@ class IcebergArchiver:
                 result.snapshots_skipped += 1
 
         if dry_run:
+            return result
+
+        # Copy the primary metadata.json to archive so restorer can read it
+        src_meta_uri = f"{table_source_root}/metadata/v{meta_version:05d}.metadata.json"
+        arc_meta_uri = src_meta_uri.replace(self._source_root, self._archive_root, 1)
+        try:
+            self._archive.copy_from(self._source, src_meta_uri, arc_meta_uri)
+            log.debug("Copied metadata.json to archive → %s", arc_meta_uri)
+        except Exception as exc:
+            result.errors.append(f"Failed to copy metadata.json to archive: {exc}")
             return result
 
         # Persist archive index
@@ -241,11 +250,12 @@ class IcebergArchiver:
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
-    def _load_metadata(self, table_root: str) -> dict:
+    def _load_metadata(self, table_root: str) -> tuple[dict, int]:
+        """Return (metadata dict, version number)."""
         version_hint_uri = f"{table_root}/metadata/version-hint.text"
         version = int(self._source.read_text(version_hint_uri).strip())
         meta_uri = f"{table_root}/metadata/v{version:05d}.metadata.json"
-        return orjson.loads(self._source.read_bytes(meta_uri))
+        return orjson.loads(self._source.read_bytes(meta_uri)), version
 
     def _archive_snapshot(
         self,
@@ -253,14 +263,26 @@ class IcebergArchiver:
         table: str,
         snapshot_id: int,
         dry_run: bool,
+        already_copied: Set[str],
     ) -> tuple[int, int]:
-        """Copy all files for snapshot_id to archive storage. Returns (files, bytes)."""
+        """
+        Copy all files for snapshot_id to archive storage.
+
+        *already_copied* is a shared set mutated in place — files already
+        transferred for a previous snapshot in the same run are skipped so
+        that data files shared across snapshots are not copied twice.
+
+        Returns (files_copied, bytes_copied) for this snapshot only.
+        """
         files = scan_snapshot(
             storage=self._source,
             metadata=metadata,
             snapshot_id=snapshot_id,
             requested_partitions=[],  # all partitions
         )
+
+        # Deduplicate against files already transferred in this archive run
+        new_files = [f for f in files if f.file_path not in already_copied]
 
         files_copied = 0
         bytes_copied = 0
@@ -275,15 +297,17 @@ class IcebergArchiver:
             return scanned_file.file_size_bytes
 
         with ThreadPoolExecutor(max_workers=self._parallelism) as pool:
-            futures = {pool.submit(_copy_file, f): f for f in files}
+            futures = {pool.submit(_copy_file, f): f for f in new_files}
             for future in as_completed(futures):
+                f = futures[future]
                 try:
                     bytes_copied += future.result()
                     files_copied += 1
+                    already_copied.add(f.file_path)
                 except Exception as exc:
-                    log.warning("File copy failed: %s", exc)
+                    log.warning("File copy failed for %s: %s", f.file_path, exc)
 
-        # Also archive the metadata files for this snapshot
+        # Archive the Avro metadata files for this snapshot
         if not dry_run:
             self._archive_metadata_files(metadata, table, snapshot_id)
 
