@@ -63,6 +63,67 @@ flowchart TD
 
 ---
 
+## Archive & Partition Restore
+
+Cold storage archival with on-demand partition-level restore.
+See [docs/archive.md](docs/archive.md) for the full guide.
+
+```mermaid
+flowchart LR
+    subgraph primary["Primary Storage (hot)"]
+        P_META[metadata.json\ncurrent snapshots]
+        P_DATA[data files]
+    end
+
+    subgraph cold["Archive Storage (cold / cheap)"]
+        C_META[archived metadata\n+ manifests]
+        C_DATA[archived data files]
+        C_IDX[.archive-manifest.json\nrestore index]
+    end
+
+    subgraph archive_cli["iceberg-archive CLI"]
+        ARC[archive\nnightly — cron / Airflow]
+        SNAP[snapshots\nbrowse restore points]
+        RST[restore\nplan → confirm → execute]
+    end
+
+    ARC -- "copy snapshots older than N days" --> cold
+    ARC -- "expire old snapshots from primary" --> primary
+    SNAP -- "read index" --> C_IDX
+    RST -- "1 dry-run plan\n2 --confirm execute" --> cold
+    RST -- "copy partition files back" --> primary
+
+    style primary      fill:#dbeafe,stroke:#2563eb
+    style cold         fill:#f3f4f6,stroke:#6b7280
+    style archive_cli  fill:#fef3c7,stroke:#d97706
+```
+
+### Quick example
+
+```bash
+# 1. Archive snapshots older than 30 days
+iceberg-archive archive \
+  --source-root "s3://warehouse/iceberg/" \
+  --archive-root "s3://cold-archive/iceberg/" \
+  --table "gold/orders" --older-than 30d --no-dry-run
+
+# 2. Browse what is available to restore
+iceberg-archive snapshots \
+  --archive-root "s3://cold-archive/iceberg/" --table "gold/orders"
+
+# 3. Plan (dry-run, always first)
+iceberg-archive restore \
+  --archive-root "s3://cold-archive/iceberg/" \
+  --target-root "s3://warehouse/iceberg/" \
+  --table "gold/orders" \
+  --partition "year=2025/month=11" --as-of "2025-12-01"
+
+# 4. Execute after reviewing the plan
+iceberg-archive restore ... --confirm
+```
+
+---
+
 ## What it does
 
 ### Sync steps (①–⑤)
@@ -75,7 +136,18 @@ flowchart TD
 ⑤ Register   NessieCatalog commits the new pointer (optimistic concurrency)
 ```
 
-### Security layers (⑥–⑨)
+### Archive & Restore (⑥–⑨)
+
+```
+⑥ Archive    Periodically copy old snapshots to cold storage; expire from primary
+⑦ Index      .archive-manifest.json written to cold storage — lists every restore point
+⑧ Plan       Dry-run: scan partitions, detect conflicts, print plan before any writes
+⑨ Restore    Copy matching partition files back; reconstruct metadata; commit pointer
+```
+
+> See [docs/archive.md](docs/archive.md) for the full guide.
+
+### Security layers (⑩–⑬)
 
 ```
 ⑥ Authenticate   OAuth 2.0 client credentials; RS256 JWT; OIDC discovery
@@ -224,6 +296,8 @@ curl -s -X POST http://localhost:8181/v1/data/iceberg/policy \
 | Topic | Guide |
 |-------|-------|
 | Sync engine — CLI, Python API, platform support, consistency | [docs/catalog-sync.md](docs/catalog-sync.md) |
+| **Archive & partition restore — config, workflow, examples** | **[docs/archive.md](docs/archive.md)** |
+| Archive module — design, class diagrams, data flows | [docs/archive-dev.md](docs/archive-dev.md) |
 | Nessie — PostgreSQL config, JWT auth, API usage | [docs/nessie-setup.md](docs/nessie-setup.md) |
 | OAuth service — token flow, client management, OIDC | [docs/oauth-setup.md](docs/oauth-setup.md) |
 | OPA policies — Rego structure, enforcement layers, adding principals | [docs/opa-policies.md](docs/opa-policies.md) |
@@ -250,11 +324,21 @@ catalog-sync/
 │   │   ├── adls.py                # Azure ADLS Gen2
 │   │   ├── gcs.py                 # Google Cloud Storage
 │   │   └── memory.py              # In-memory (tests)
+│   ├── archive/
+│   │   ├── archiver.py            # IcebergArchiver — copy snapshots to cold storage
+│   │   ├── restorer.py            # IcebergRestorer — plan + execute partition restore
+│   │   ├── config.py              # YAML config (ArchiveJobConfig, RestoreJobConfig)
+│   │   ├── archive_index.py       # .archive-manifest.json read/write
+│   │   ├── partition_scanner.py   # Avro manifest walker + partition filter
+│   │   ├── restore_planner.py     # RestorePlan dry-run builder
+│   │   ├── snapshot_manager.py    # Retention policy decisions
+│   │   └── metadata_editor.py     # metadata.json reconstruction for restore/expiry
 │   ├── sync/
 │   │   └── catalog_sync.py        # CatalogSync orchestrator
 │   ├── airflow/
 │   │   └── operators.py           # Airflow operator wrappers
-│   └── cli.py                     # Click CLI
+│   ├── archive_cli.py             # iceberg-archive CLI entry point
+│   └── cli.py                     # iceberg-sync CLI entry point
 │
 ├── oauth_service/                 # OAuth 2.0 server (FastAPI)
 │   ├── main.py                    # Token, JWKS, OIDC discovery, client CRUD
