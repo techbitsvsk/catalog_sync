@@ -22,6 +22,7 @@ fine-grained access control enforcement.
    - [4.8 PolicyClient](#48-policyclient)
    - [4.9 CLI](#49-cli)
    - [4.10 Airflow Operators](#410-airflow-operators)
+   - [4.11 Archive Module](#411-archive-module)
 5. [Full Data Flow](#5-full-data-flow)
 6. [Local Development Setup](#6-local-development-setup)
 7. [Running Tests](#7-running-tests)
@@ -47,6 +48,7 @@ fine-grained access control enforcement.
 13. [Key Design Decisions](#13-key-design-decisions)
 14. [Troubleshooting](#14-troubleshooting)
 15. [Common Pitfalls](#15-common-pitfalls)
+16. [Iceberg Metadata Internals — Archive & Restore](#16-iceberg-metadata-internals--archive--restore)
 
 ---
 
@@ -100,6 +102,11 @@ catalog-sync/
 │   │   └── rewriter.py          # URI rewrite + version-hint commit
 │   ├── catalog/
 │   │   └── nessie.py            # Nessie v2 API client (OAuth + policy)
+│   ├── archive/                 # Cold-storage archival + partition restore
+│   │   ├── __init__.py          # exports IcebergArchiver, IcebergRestorer
+│   │   ├── archiver.py          # IcebergArchiver — snapshot eviction + cold copy
+│   │   ├── restorer.py          # IcebergRestorer — plan / execute partition restore
+│   │   └── config.py            # ArchiveJobConfig, RestoreJobConfig, S3Config, ADLSConfig
 │   └── airflow/
 │       └── operators.py         # Airflow operator wrappers
 │
@@ -130,8 +137,25 @@ catalog-sync/
 │       └── init-dbs.sh          # Creates: nessie, oauth, airflow databases
 │
 ├── docs/
+│   ├── archive.md               # Archive module user guide
+│   ├── archive-dev.md           # Archive module internals
 │   ├── oauth-setup.md           # OAuth token flow + client management guide
 │   └── opa-policies.md          # OPA policy structure, enforcement layers, how-to
+│
+├── e2e/                         # End-to-end tests and runnable demos
+│   ├── README.md                # Complete step-by-step E2E guide
+│   ├── configs/                 # archive.yaml / restore.yaml / *_adls.yaml
+│   ├── scripts/
+│   │   ├── connection.py        # IcebergConnectionBuilder — unified S3 + ADLS API
+│   │   ├── full_workflow.py     # ★ all 6 stages chained (generate → access)
+│   │   ├── iceberg_table.py     # unified create/archive/restore/verify
+│   │   ├── 01_generate_tpch.py  # TPC-H Parquet generation (DuckDB)
+│   │   ├── 03_verify_partitions.py
+│   │   ├── 04_archive.py
+│   │   ├── 05_restore.py
+│   │   └── 06_access_control.py
+│   └── airflow_dags/
+│       └── archive_pipeline_dag.py
 │
 ├── airflow_dags/
 │   └── iceberg_sync_dag.py      # DAG factory + SyncPipelineConfig
@@ -161,7 +185,7 @@ catalog-sync/
    ┌──────────────────────┐                             ┌────────────────────────┐
    │   nessie:19120        │                             │  oauth-service:8081    │
    │  (NOT host-exposed)   │ ◄── OIDC validates JWT      │                        │
-   │  /iceberg/v1/*        │     via JWKS               │  POST /token           │
+   │  /api/v2/*            │     via JWKS               │  POST /token           │
    │  (JDBC backend)       │                             │  GET  /.well-known/*   │
    └──────────▲────────────┘                             └────────────────────────┘
               │ admin Bearer JWT
@@ -539,6 +563,70 @@ register = NessieCatalogRegisterOperator(
     ...
 )
 ```
+
+---
+
+### 4.11 Archive Module
+
+**Files:** `src/iceberg_sync/archive/`
+
+Cold-storage archival with on-demand partition-level restore. Works with both S3 and
+ADLS Gen2 backends. See [docs/archive.md](docs/archive.md) for the user guide and
+[e2e/scripts/full_workflow.py](e2e/scripts/full_workflow.py) for a runnable demo.
+
+**Public API:**
+
+```python
+from iceberg_sync.archive.archiver import IcebergArchiver
+from iceberg_sync.archive.restorer import IcebergRestorer
+from iceberg_sync.archive.config  import ArchiveJobConfig, RestoreJobConfig, S3Config, ADLSConfig
+
+# Archive — evict old snapshots to cold storage
+cfg      = ArchiveJobConfig(source_root=..., archive_root=..., table=...,
+                             older_than="150d", min_snapshots_to_keep=5,
+                             source_s3=S3Config(...), archive_s3=S3Config(...))
+archiver = IcebergArchiver.from_config(cfg)
+plan     = archiver.archive_table("tpch/orders", dry_run=True)   # inspect first
+result   = archiver.archive_table("tpch/orders", dry_run=False)  # execute
+
+# Restore — bring a partition back from cold storage
+cfg      = RestoreJobConfig(archive_root=..., target_root=..., table=...,
+                             partitions=[{"order_month": "2024-03"}],
+                             mode="replace", conflict_strategy="skip",
+                             archive_s3=S3Config(...), target_s3=S3Config(...))
+restorer = IcebergRestorer.from_config(cfg)
+snapshots = restorer.list_snapshots()   # browse archive index
+plan      = restorer.plan()             # dry-run: files, bytes, conflicts
+result    = restorer.execute(plan)      # data copied before metadata rewritten
+```
+
+**Using the connection builder (recommended):**
+
+```python
+# e2e/scripts/connection.py — builds ArchiveJobConfig / RestoreJobConfig for you
+conn = (
+    IcebergConnectionBuilder()
+    .s3(...).nessie(...).oauth(...).warehouse(...).archive(...)
+    .build()
+)
+archive_cfg  = conn.make_archive_config("tpch/orders", older_than="150d")
+restore_cfg  = conn.make_restore_config("tpch/orders",
+                                        partitions=[{"order_month": "2024-03"}])
+```
+
+**Key config fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `older_than` | str | Age threshold, e.g. `"150d"`, `"6m"`, `"1y"` |
+| `min_snapshots_to_keep` | int | Always keep at least this many snapshots live |
+| `delete_after_archive` | bool | Remove archived data files from primary after copy |
+| `mode` | str | Restore mode: `replace` (default), `append`, `new_table` |
+| `conflict_strategy` | str | On file conflict: `fail`, `skip`, `overwrite` |
+| `parallelism` | int | Concurrent file copy threads (default 4) |
+
+> See [Section 16](#16-iceberg-metadata-internals--archive--restore) for a detailed
+> explanation of what happens to each Iceberg metadata file during archive and restore.
 
 ---
 
@@ -1902,3 +1990,191 @@ Always set warehouse **without** a trailing slash:
 spark.sql.catalog.aws.warehouse = s3a://warehouse/aws    ✓
 spark.sql.catalog.aws.warehouse = s3a://warehouse/aws/   ✗
 ```
+
+---
+
+## 16. Iceberg Metadata Internals — Archive & Restore
+
+This section is for data engineers who are new to Apache Iceberg and want to
+understand what actually happens on disk when you archive or restore a partition.
+No Iceberg background assumed.
+
+---
+
+### 16.1 The Iceberg Metadata Chain
+
+Every Iceberg table is a chain of files. Before touching archive or restore, picture
+this hierarchy — each file points to the one below it:
+
+```
+metadata.json
+  │  "current-snapshot-id": 9876
+  │  "snapshots": [ {id: 9876, manifest-list: "snap-9876.avro"}, ... ]
+  │
+  └─► snap-9876.avro          ← manifest-list (one per snapshot)
+        │  one row per manifest file
+        │  "manifest_path": "man-001.avro"
+        │
+        └─► man-001.avro      ← manifest (one per partition or write batch)
+              │  one row per data file
+              │  "data_file.file_path": "part-00001.parquet"
+              │  "data_file.partition": {"order_month": "2024-06"}
+              │
+              └─► part-00001.parquet   ← your actual data (Parquet)
+```
+
+| Layer | File type | Contains |
+|-------|-----------|----------|
+| `metadata.json` | JSON | Table schema, partition spec, list of all snapshots and their manifest-list paths |
+| Manifest-list (`.avro`) | Avro | One row per manifest: path, partition summary, added/deleted file counts |
+| Manifest (`.avro`) | Avro | One row per data file: path, partition value, row count, file size, column stats |
+| Data file (`.parquet`) | Parquet | Your actual rows |
+
+**What is a snapshot?**
+A snapshot is a point-in-time view of the table. Every `INSERT`, `DELETE`, or
+`COMPACTION` creates a new snapshot. Snapshots are cheap — they reuse unchanged
+manifest and data files. Only the diff (new/deleted manifests) is written.
+
+**Why do paths matter?**
+Every path embedded in these files is absolute (`s3a://bucket/path/to/file`).
+If you copy files to a different bucket without rewriting the paths, Iceberg still
+thinks the files are in the original location — queries fail.
+
+---
+
+### 16.2 What Archival Does, Step by Step
+
+**Goal:** Move the 5 oldest snapshots from primary storage (`warehouse/iceberg/`)
+to cold storage (`warehouse/archive/`), freeing space while keeping the data
+recoverable.
+
+```
+Before archive:
+  metadata.json  ─►  snap-1.avro  snap-2.avro  ...  snap-10.avro
+  Data files:    month=2024-01 through month=2024-10
+
+After archive (keep last 5, archive first 5):
+  Primary:  metadata.json  ─►  snap-6 ... snap-10
+            Data files:    month=2024-06 through month=2024-10
+
+  Archive:  archive-metadata.json  ─►  snap-1 ... snap-5  (rewritten paths)
+            Data files:             month=2024-01 through month=2024-05
+            .archive-manifest.json  (index of what was archived and when)
+```
+
+**Step-by-step:**
+
+1. **Identify old snapshots**
+   The archiver reads `metadata.json` and finds snapshots older than the threshold
+   (`older_than=150d`) while keeping at least `min_snapshots_to_keep=5`.
+
+2. **Find exclusively-owned data files**
+   For each old snapshot, the archiver reads its manifest-list → manifests → data
+   file paths. It then checks which of those files are **not** referenced by any
+   snapshot that will be kept. Only files with no live reference are safe to move.
+
+3. **Copy data files to archive storage**
+   Files are copied from `s3a://warehouse/iceberg/tpch/orders/data/` to
+   `s3a://warehouse/archive/tpch/orders/data/`. Data is written first — if this
+   step fails, the primary table is still intact.
+
+4. **Rewrite manifest files**
+   Each manifest Avro file is read row-by-row. Every `data_file.file_path` is
+   rewritten from the primary path to the archive path. The rewritten manifests
+   are written to the archive location.
+   > This is done with `fastavro` (not PyIceberg) — it rewrites raw Avro bytes
+   > without any Iceberg spec coupling.
+
+5. **Rewrite manifest-list files**
+   Each manifest-list Avro is rewritten so that `manifest_path` entries point to
+   the new archive manifests (from step 4).
+
+6. **Write archive metadata.json**
+   A new `metadata.json` is written to the archive location. It contains only the
+   archived snapshots, with `location` and all snapshot pointers rewritten to the
+   archive URI.
+
+7. **Write the archive index**
+   `.archive-manifest.json` is written alongside the archive metadata. It maps
+   snapshot IDs → archive metadata location so the restorer can find them later
+   without scanning all of object storage.
+
+8. **Trim live metadata.json**
+   The old snapshot entries are removed from the primary `metadata.json` and a new
+   version is committed. The data files for archived snapshots are deleted from
+   primary storage (if `delete_after_archive=True`).
+
+9. **Update the catalog pointer**
+   The Nessie catalog is updated to point at the new (trimmed) primary `metadata.json`.
+   Queries issued after this point only see the kept snapshots.
+
+---
+
+### 16.3 What Restore Does, Step by Step
+
+**Goal:** Bring `order_month=2024-03` back from the archive into the live table
+so queries can access it again.
+
+**Step-by-step:**
+
+1. **Look up the archived snapshot**
+   The restorer reads `.archive-manifest.json` from the archive root to find which
+   archive `metadata.json` contains the target partition (`order_month=2024-03`)
+   and the requested point-in-time (`as_of`).
+
+2. **Build a restore plan**
+   The restorer reads the archive manifest chain to enumerate every data file for
+   the target partition. It checks whether any of those files already exist on
+   primary storage (conflicts). The plan shows: file count, total bytes, conflict
+   count — all without writing anything.
+
+3. **Copy data files back to primary**
+   Files are copied from `s3a://warehouse/archive/tpch/orders/data/` back to
+   `s3a://warehouse/iceberg/tpch/orders/data/`. Data moves first — metadata is
+   never updated until all copies succeed.
+
+4. **Rewrite manifests with primary paths**
+   The same URI rewrite process as archive, but in reverse: archive paths → primary
+   paths. New manifest Avro files are written to the primary metadata location.
+
+5. **Add a new snapshot to live metadata.json**
+   A new snapshot entry referencing the rewritten manifests is appended to the
+   primary `metadata.json`. The existing live snapshots are untouched.
+
+6. **Update the catalog pointer**
+   Nessie is updated to the new `metadata.json`. The restored partition is now
+   visible to all queries, alongside the snapshots that were already live.
+
+---
+
+### 16.4 Restore Modes
+
+| Mode | Behaviour | Use when |
+|------|-----------|----------|
+| `replace` | Remove any existing rows for the partition, then add restored rows | Re-ingesting a partition that was partially archived |
+| `append` | Add restored rows alongside existing rows (may cause duplicates) | Merging archived and live data |
+| `new_table` | Restore into a separate table, not the original | Auditing or comparing historical data |
+
+### 16.5 Conflict Strategies
+
+When a data file that needs to be restored already exists on primary storage:
+
+| Strategy | Behaviour |
+|----------|-----------|
+| `fail` | Abort the restore immediately (default — safe) |
+| `skip` | Keep the existing primary file, skip the archive copy |
+| `overwrite` | Overwrite the primary file with the archived version |
+
+---
+
+### 16.6 End-to-End Demo
+
+Run all steps against a real local stack in one command:
+
+```bash
+python e2e/scripts/full_workflow.py
+```
+
+This generates 1.5 M rows → creates the Iceberg table → archives 5 snapshots →
+restores 1 → verifies row counts → demonstrates OPA access control.
+See [e2e/README.md](e2e/README.md) for the full guide.

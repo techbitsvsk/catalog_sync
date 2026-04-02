@@ -1,0 +1,55 @@
+# e2e/configs/archive_adls.yaml
+#
+# Archive job — source: ADLS Gen2 (Azure Data Lake Storage)
+#               destination: ADLS Gen2 cold-tier container
+#
+# Microsoft Fabric stores Iceberg table metadata in OneLake (ADLS Gen2 endpoint).
+# The source_root points directly to the Lakehouse Files section where the
+# Iceberg warehouse lives.
+#
+# Run (dry-run):
+#   iceberg-archive archive --config e2e/configs/archive_adls.yaml
+#
+# Run (execute):
+#   iceberg-archive archive --config e2e/configs/archive_adls.yaml --no-dry-run
+#
+# Environment variables (set before running):
+#   AZURE_STORAGE_ACCOUNT   — your storage account name (e.g. myfabricaccount)
+#   AZURE_STORAGE_KEY       — storage account access key (or use SAS / service principal)
+#   FABRIC_WORKSPACE_ID     — Microsoft Fabric workspace GUID
+#   FABRIC_LAKEHOUSE_ID     — Microsoft Fabric Lakehouse GUID
+
+source_root: "abfss://fabric@${AZURE_STORAGE_ACCOUNT}.dfs.core.windows.net/workspaces/${FABRIC_WORKSPACE_ID}/lakehouses/${FABRIC_LAKEHOUSE_ID}/Tables"
+table: "tpch/orders"
+
+archive_root: "abfss://archive@${AZURE_STORAGE_ACCOUNT}.dfs.core.windows.net/iceberg-cold"
+
+# Retention: keep last 5 monthly snapshots; archive everything older
+older_than: "150d"
+min_snapshots_to_keep: 5
+delete_after_archive: true
+
+transfer:
+  parallelism: 8
+
+# Source: Fabric OneLake (ADLS Gen2)
+source_adls:
+  account_name: "${AZURE_STORAGE_ACCOUNT}"
+  account_key: "${AZURE_STORAGE_KEY}"
+  # Alternative: use DefaultAzureCredential (managed identity / az login)
+  # Remove account_key above and set use_default_credential: true
+  # use_default_credential: true
+
+# Archive destination: cold-tier container in the same (or different) account
+archive_adls:
+  account_name: "${AZURE_STORAGE_ACCOUNT}"
+  account_key: "${AZURE_STORAGE_KEY}"
+
+catalog:
+  # Nessie endpoint — set to your Nessie deployment or leave blank to use
+  # version-hint.text as the catalog pointer (Hadoop-compatible)
+  nessie_uri: "${NESSIE_URI}"
+  nessie_ref: "main"
+  oauth_url: "${OAUTH_URL}"
+  oauth_client_id: "${OAUTH_CLIENT_ID}"
+  oauth_client_secret: "${OAUTH_CLIENT_SECRET}"

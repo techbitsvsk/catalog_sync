@@ -1,0 +1,43 @@
+# e2e/configs/restore_adls.yaml
+#
+# Restore job — archive: ADLS Gen2 cold container
+#               target:  Fabric OneLake (ADLS Gen2)
+#
+# Restores the March-2024 partition of tpch/orders from cold storage back
+# into the Fabric Lakehouse Iceberg table.
+#
+# Run (plan):
+#   iceberg-archive restore --config e2e/configs/restore_adls.yaml
+#
+# Run (execute):
+#   iceberg-archive restore --config e2e/configs/restore_adls.yaml --confirm
+
+archive_root: "abfss://archive@${AZURE_STORAGE_ACCOUNT}.dfs.core.windows.net/iceberg-cold"
+table: "tpch/orders"
+target_root: "abfss://fabric@${AZURE_STORAGE_ACCOUNT}.dfs.core.windows.net/workspaces/${FABRIC_WORKSPACE_ID}/lakehouses/${FABRIC_LAKEHOUSE_ID}/Tables"
+
+as_of: "2024-04-01"
+
+partitions:
+  - order_month: "2024-03"
+
+mode: "replace"
+conflict_strategy: "skip"
+
+transfer:
+  parallelism: 8
+
+archive_adls:
+  account_name: "${AZURE_STORAGE_ACCOUNT}"
+  account_key: "${AZURE_STORAGE_KEY}"
+
+target_adls:
+  account_name: "${AZURE_STORAGE_ACCOUNT}"
+  account_key: "${AZURE_STORAGE_KEY}"
+
+catalog:
+  nessie_uri: "${NESSIE_URI}"
+  nessie_ref: "main"
+  oauth_url: "${OAUTH_URL}"
+  oauth_client_id: "${OAUTH_CLIENT_ID}"
+  oauth_client_secret: "${OAUTH_CLIENT_SECRET}"

@@ -1,0 +1,60 @@
+# e2e/configs/restore.yaml
+# Restore job configuration for local E2E test
+#
+# Restore the March-2024 partition (order_month=2024-03) from archive
+# back into the live table.
+#
+# Run (dry-run / plan):
+#   iceberg-archive restore --config e2e/configs/restore.yaml
+#
+# Run (execute after reviewing plan):
+#   iceberg-archive restore --config e2e/configs/restore.yaml --confirm
+
+archive_root: "s3a://warehouse/archive"
+table: "tpch/orders"
+target_root: "s3a://warehouse/iceberg"
+
+# Which snapshot to restore from (leave both blank → latest archived snapshot)
+# snapshot_id: 1234567890000
+as_of: "2024-04-01"          # restores the latest snapshot as of this date
+
+# Partitions to restore. Omit to restore the full table.
+partitions:
+  - order_month: "2024-03"   # restore March 2024 only
+
+# How to merge restored data into the live table:
+#   replace   — remove current partition data and put archived data back  (default)
+#   append    — add archived data as a new snapshot alongside current data
+#   new_table — write to a brand-new table (use restore_as below)
+mode: "replace"
+
+# What to do when a file already exists at the target path:
+#   fail      — abort restore if any conflict found                       (default)
+#   skip      — leave existing files, only copy new ones
+#   overwrite — copy regardless, overwriting existing files
+conflict_strategy: "skip"
+
+# Side-by-side restore: restore to a different table name instead of replacing
+# restore_as: "tpch/orders_march_2024_recovered"
+
+transfer:
+  parallelism: 8
+
+archive_s3:
+  endpoint: "http://localhost:9000"
+  access_key: "minioadmin"
+  secret_key: "minioadmin"
+  region: "us-east-1"
+
+target_s3:
+  endpoint: "http://localhost:9000"
+  access_key: "minioadmin"
+  secret_key: "minioadmin"
+  region: "us-east-1"
+
+catalog:
+  nessie_uri: "http://localhost:19120"
+  nessie_ref: "main"
+  oauth_url: "http://localhost:8081/oauth2/token"
+  oauth_client_id: "sync-service"
+  oauth_client_secret: "sync-secret"
