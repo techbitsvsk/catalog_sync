@@ -250,8 +250,8 @@ OPA policy before forwarding to Nessie.
 |-----------|--------|--------|
 | `admin-client` | `admin-secret` | All namespaces, all ops, no RLS/CLS |
 | `sync-service` | `sync-secret` | All namespaces, read + write, no RLS/CLS |
-| `analytics-client` | `analytics-secret` | `gold` read only, EMEA rows, PII masked |
-| `data-scientist` | `ds-secret` | `silver`+`bronze` read, no RLS, PII excluded |
+| `analytics-client` | `analytics-secret` | `gold` namespace read-only; EMEA rows only; clerk column masked |
+| `data-scientist` | `ds-secret` | `silver`+`bronze` namespaces read-only; PII columns excluded |
 
 > Change all secrets before any non-local deployment.
 

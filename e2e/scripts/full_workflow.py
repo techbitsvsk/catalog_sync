@@ -512,8 +512,8 @@ def stage_verify(conn) -> dict:
 DEMO_CLIENTS = [
     ("admin-client",     "admin-secret",     "Unrestricted admin"),
     ("sync-service",     "sync-secret",      "Read + write all namespaces"),
-    ("analytics-client", "analytics-secret", "Gold read · EMEA rows · PII masked"),
-    ("data-scientist",   "ds-secret",        "Silver/bronze read · PII excluded"),
+    ("analytics-client", "analytics-secret", "Gold namespace only · EMEA rows · clerk masked"),
+    ("data-scientist",   "ds-secret",        "Silver/bronze namespaces only · PII excluded"),
 ]
 
 

@@ -134,22 +134,22 @@ flowchart LR
 ╭── Stage 6/6 — ACCESS ──╮
   Client             Status  Rows        Note
   ════════════════════════════════════════════
-  admin-client       OK      749,120     Unrestricted admin
-  sync-service       OK      749,120     Read + write all namespaces
-  analytics-client   OK      ~300,000    Gold read · EMEA rows · PII masked
+  admin-client       OK      150,000     Unrestricted admin
+  sync-service       OK      150,000     Read + write all namespaces
+  analytics-client   403     —           Gateway enforcement ✓ — tpch not in gold policy
   data-scientist     403     —           Gateway enforcement ✓ — access denied
 
 ╭── End-to-End Workflow Complete ──╮
   Backend     : s3
   Warehouse   : s3a://warehouse/iceberg
-  Archive     : s3a://warehouse/archive
+  Archive     : abfss://archive@<account>.dfs.core.windows.net/iceberg-cold
   Elapsed     : 47.3s
   Generated   : 10 months  148.9 MB  (12.4s)
   Table       : tpch.orders  10 partitions  1,500,000 rows
   Archived    : 5 snapshot(s)  5 files  77,631,488 bytes
   Restored    : order_month=2024-03  1 files  14,680,064 bytes
-  Verify      : 749,120 total rows  6 partitions  restored=139,751
-  Access ctrl : 3 allowed  1 blocked by OPA
+  Verify      : 150,000 total rows  restored partition present
+  Access ctrl : 2 allowed  2 blocked by OPA
 ```
 
 ---
