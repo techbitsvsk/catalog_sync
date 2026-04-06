@@ -97,13 +97,16 @@ class IcebergRestorer:
 
             auth = None
             if cfg.catalog.oauth_url:
+                server_url = cfg.catalog.oauth_url
+                if server_url.endswith("/token"):
+                    server_url = server_url[: -len("/token")]
                 auth = OAuthClient(
-                    token_url=cfg.catalog.oauth_url,
+                    server_url=server_url,
                     client_id=cfg.catalog.oauth_client_id or "",
                     client_secret=cfg.catalog.oauth_client_secret or "",
                 )
             nessie = NessieCatalog(
-                base_url=cfg.catalog.nessie_uri,
+                uri=cfg.catalog.nessie_uri,
                 ref=cfg.catalog.nessie_ref,
                 oauth_client=auth,
             )
@@ -174,7 +177,12 @@ class IcebergRestorer:
             )
 
         # Load archived metadata.json to access the manifest chain
-        archived_metadata = self._load_archived_metadata(cfg.table)
+        archived_metadata = self._load_archived_metadata(cfg.table, entry.snapshot_id)
+
+        # Build a URI rewriter so scan_snapshot can resolve manifest paths that
+        # still contain the original source URI base (e.g. s3a://warehouse/…)
+        # to their archive equivalents (e.g. abfss://archive@…/iceberg-cold/…).
+        path_rewriter = self._make_path_rewriter(index.source_root)
 
         # Scan partitions
         files = scan_snapshot(
@@ -182,6 +190,7 @@ class IcebergRestorer:
             metadata=archived_metadata,
             snapshot_id=entry.snapshot_id,
             requested_partitions=cfg.partitions,
+            path_rewriter=path_rewriter,
         )
 
         if not files:
@@ -237,7 +246,10 @@ class IcebergRestorer:
                 "Set conflict_strategy=overwrite or conflict_strategy=skip to proceed."
             )
 
-        archived_metadata = self._load_archived_metadata(cfg.table)
+        index = ArchiveIndex.load(self._archive, cfg.archive_root, cfg.table)
+        path_rewriter = self._make_path_rewriter(index.source_root)
+
+        archived_metadata = self._load_archived_metadata(cfg.table, plan.snapshot_id)
         effective_table = plan.effective_table
         target_table_root = f"{cfg.target_root.rstrip('/')}/{effective_table}"
 
@@ -281,6 +293,7 @@ class IcebergRestorer:
             snapshot_id=plan.snapshot_id,
             archive_root=cfg.archive_root,
             target_table_root=target_table_root,
+            path_rewriter=path_rewriter,
         )
 
         # ── Reconstruct metadata ────────────────────────────────────────────
@@ -328,28 +341,155 @@ class IcebergRestorer:
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
-    def _load_archived_metadata(self, table: str) -> dict:
-        table_archive_root = f"{self._cfg.archive_root.rstrip('/')}/{table}"
-        # Find the latest versioned metadata.json in the archive
-        latest_uri: Optional[str] = None
-        latest_ver = -1
-        for fi in self._archive.list_objects(f"{table_archive_root}/metadata/"):
-            name = fi.uri.split("/")[-1]
-            if name.endswith(".metadata.json") and name.startswith("v"):
-                try:
-                    ver = int(name.split(".")[0].lstrip("v"))
-                    if ver > latest_ver:
-                        latest_ver = ver
-                        latest_uri = fi.uri
-                except ValueError:
-                    pass
+    def _make_path_rewriter(self, source_root: str):
+        """
+        Return a callable that translates a source-storage URI to its archive
+        equivalent.
 
-        if latest_uri is None:
+        The archiver strips the source bucket prefix (scheme://netloc) and
+        prepends archive_root when it copies files, so we do the same here.
+        For example:
+            s3a://warehouse/tpch/orders_uuid/metadata/abc.avro
+            → abfss://archive@account.dfs.core.windows.net/iceberg-cold/tpch/orders_uuid/metadata/abc.avro
+        """
+        from urllib.parse import urlparse
+        p = urlparse(source_root)
+        source_base = f"{p.scheme}://{p.netloc}"  # e.g. "s3a://warehouse"
+        archive_root = self._cfg.archive_root.rstrip("/")
+
+        def _rewrite(uri: str) -> str:
+            if uri.startswith(archive_root):
+                return uri  # already an archive URI
+            if uri.startswith(source_base):
+                return archive_root + uri[len(source_base):]
+            return uri  # unknown scheme — return as-is
+
+        return _rewrite
+
+    def _load_archived_metadata(self, table: str, snapshot_id: Optional[int] = None) -> dict:
+        table_archive_root = f"{self._cfg.archive_root.rstrip('/')}/{table}"
+        metadata_prefix = f"{table_archive_root}/metadata/"
+
+        # Collect all .metadata.json files — handles both Hadoop-style (v1.metadata.json)
+        # and Nessie-style (UUID.metadata.json) naming conventions.
+        candidates: List[str] = []
+        for fi in self._archive.list_objects(metadata_prefix):
+            if fi.uri.endswith(".metadata.json"):
+                candidates.append(fi.uri)
+
+        if not candidates:
+            # Nessie stores tables at a UUID-suffixed path (e.g. orders_<uuid>/)
+            # rather than the logical table name (orders/).  Search the parent
+            # namespace directory for any subdirectory that starts with the table
+            # leaf name and contains metadata files.
+            namespace, table_name = (table.rsplit("/", 1) if "/" in table else ("", table))
+            ns_prefix = f"{self._cfg.archive_root.rstrip('/')}/{namespace}/" if namespace else f"{self._cfg.archive_root.rstrip('/')}/"
+            for fi in self._archive.list_objects(ns_prefix):
+                if not fi.uri.endswith(".metadata.json"):
+                    continue
+                # e.g. …/tpch/orders_<uuid>/metadata/abc.metadata.json
+                parts = fi.uri[len(ns_prefix):].split("/")
+                if parts and parts[0].startswith(table_name) and "metadata" in parts:
+                    candidates.append(fi.uri)
+
+        if not candidates:
             raise FileNotFoundError(
                 f"No metadata.json found in archive for table '{table}' at "
-                f"{table_archive_root}/metadata/"
+                f"{metadata_prefix}"
             )
-        return orjson.loads(self._archive.read_bytes(latest_uri))
+
+        # Prefer Hadoop-style versioned files (v<N>.metadata.json) — pick highest N.
+        versioned = {}
+        for uri in candidates:
+            name = uri.split("/")[-1]
+            if name.startswith("v"):
+                try:
+                    ver = int(name.split(".")[0].lstrip("v"))
+                    versioned[ver] = uri
+                except ValueError:
+                    pass
+        if versioned:
+            return orjson.loads(self._archive.read_bytes(versioned[max(versioned)]))
+
+        # UUID-named files (Nessie): each metadata file typically covers one snapshot.
+        # Read all candidates and build a map; prefer the file that contains the
+        # target snapshot_id (exact match), then fall back to highest last-updated-ms.
+        parsed: List[tuple] = []  # (last-updated-ms, uri, meta_dict)
+        for uri in candidates:
+            try:
+                meta = orjson.loads(self._archive.read_bytes(uri))
+                ts = meta.get("last-updated-ms", 0)
+                parsed.append((ts, uri, meta))
+            except Exception:
+                pass
+
+        if not parsed:
+            raise FileNotFoundError(
+                f"No readable metadata.json found in archive for table '{table}' at "
+                f"{metadata_prefix}"
+            )
+
+        parsed.sort(key=lambda x: x[0], reverse=True)
+
+        # If we know the target snapshot, prefer the file that contains it.
+        if snapshot_id is not None:
+            for _ts, _uri, meta in parsed:
+                snaps = meta.get("snapshots", [])
+                if any(s.get("snapshot-id") == snapshot_id for s in snaps):
+                    log.debug("Using metadata %s (contains snapshot %s)", _uri, snapshot_id)
+                    return meta
+
+            # No single file contains the snapshot — try merging all metadata files
+            # (handles Nessie one-snapshot-per-file where the most-recent file is archived).
+            import copy
+            base_meta = copy.deepcopy(parsed[0][2])
+            merged_snaps: Dict[int, Any] = {
+                s["snapshot-id"]: s for s in base_meta.get("snapshots", [])
+            }
+            for _ts, _uri, meta in parsed[1:]:
+                for s in meta.get("snapshots", []):
+                    sid = s.get("snapshot-id")
+                    if sid is not None and sid not in merged_snaps:
+                        merged_snaps[sid] = s
+            base_meta["snapshots"] = list(merged_snaps.values())
+
+            if any(s.get("snapshot-id") == snapshot_id for s in base_meta["snapshots"]):
+                return base_meta
+
+            # Last resort: Iceberg names manifest-list files snap-{snapshot_id}-{n}.avro.
+            # The archiver copies these to the archive even though the metadata file
+            # doesn't reference them.  Scan the archived metadata directories for the file
+            # and inject a synthetic snapshot entry so the rest of the restore can proceed.
+            meta_dirs: set = {uri.rsplit("/", 1)[0] + "/" for uri in candidates}
+            for meta_dir in meta_dirs:
+                try:
+                    for fi in self._archive.list_objects(meta_dir):
+                        fname = fi.uri.split("/")[-1]
+                        if fname.startswith(f"snap-{snapshot_id}-") and fname.endswith(".avro"):
+                            log.info(
+                                "Snapshot %s not in any metadata file; "
+                                "found manifest-list by scan: %s",
+                                snapshot_id, fi.uri,
+                            )
+                            base_meta.setdefault("snapshots", []).append({
+                                "snapshot-id": snapshot_id,
+                                "timestamp-ms": 0,
+                                "manifest-list": fi.uri,
+                                "summary": {"operation": "append"},
+                            })
+                            return base_meta
+                except Exception as exc:
+                    log.debug("Manifest-list scan in %s failed: %s", meta_dir, exc)
+
+            log.warning(
+                "Snapshot %s not found in archived metadata and no matching "
+                "snap-<id>-*.avro file found; restore may fail.",
+                snapshot_id,
+            )
+            return base_meta
+
+        # No target snapshot_id provided — return the most-recently-updated metadata.
+        return parsed[0][2]
 
     def _load_target_metadata(self, table: str) -> dict:
         table_root = f"{self._cfg.target_root.rstrip('/')}/{table}"
@@ -364,6 +504,7 @@ class IcebergRestorer:
         snapshot_id: int,
         archive_root: str,
         target_table_root: str,
+        path_rewriter=None,
     ) -> List[str]:
         """Copy manifest Avro files for a snapshot; return their new target URIs."""
         snap = next(
@@ -389,8 +530,9 @@ class IcebergRestorer:
         for entry in entries:
             mpath: str = entry.get("manifest_path", "")
             if mpath:
-                target_uri = mpath.replace(archive_root, self._cfg.target_root, 1)
-                self._target.copy_from(self._archive, mpath, target_uri)
+                archive_mpath = path_rewriter(mpath) if path_rewriter else mpath
+                target_uri = archive_mpath.replace(archive_root, self._cfg.target_root, 1)
+                self._target.copy_from(self._archive, archive_mpath, target_uri)
                 target_uris.append(target_uri)
 
         return target_uris
@@ -419,7 +561,8 @@ class IcebergRestorer:
     def _commit_metadata(self, table: str, table_root: str, new_meta_uri: str) -> None:
         if self._nessie:
             try:
-                self._nessie.update(table, new_meta_uri)
+                namespace, table_name = table.rsplit("/", 1)
+                self._nessie.update_table(namespace, table_name, new_meta_uri)
                 return
             except Exception as exc:
                 log.warning("Nessie update failed, falling back to version-hint: %s", exc)

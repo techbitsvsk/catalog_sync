@@ -38,6 +38,9 @@ coverage.xml
 secrets.json
 credentials.json
 
+# E2E generated data
+e2e/data/
+
 # Temp / scratch files
 *.tmp
 *.temp

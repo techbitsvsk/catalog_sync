@@ -18,7 +18,7 @@ Usage:
             access_key="minioadmin",
             secret_key="minioadmin")
         .catalog_gateway("http://localhost:8083")
-        .oauth("http://localhost:8081/oauth2/token",
+        .oauth("http://localhost:8081/token",
                client_id="admin-client",
                client_secret="admin-secret")
         .warehouse("s3a://warehouse/iceberg")
@@ -68,9 +68,12 @@ class IcebergConnection:
     warehouse_root: str             # primary Iceberg warehouse root URI
     archive_root: str               # cold storage root URI
 
-    # Storage credentials — only one of these is populated
+    # Storage credentials — source backend
     _s3_kwargs:   Dict[str, Any] = field(default_factory=dict, repr=False)
     _adls_kwargs: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    # Archive-specific credentials (overrides source backend when set)
+    _archive_adls_kwargs: Dict[str, Any] = field(default_factory=dict, repr=False)
 
     # Catalog / auth
     _gateway_url:       Optional[str] = field(default=None,  repr=False)
@@ -146,8 +149,8 @@ class IcebergConnection:
 
     # ── iceberg_sync archive/restore configs ──────────────────────────────────
 
-    def _storage_config(self):
-        """Return (S3Config | None, ADLSConfig | None) for iceberg_sync."""
+    def _source_storage_config(self):
+        """Return (S3Config | None, ADLSConfig | None) for the source/warehouse."""
         from iceberg_sync.archive.config import S3Config, ADLSConfig
         if self.backend == "s3":
             return (
@@ -159,24 +162,34 @@ class IcebergConnection:
                 ),
                 None,
             )
-        # adls
         return (
             None,
             ADLSConfig(
                 account_name=self._adls_kwargs.get("account_name", ""),
                 account_key=self._adls_kwargs.get("account_key"),
-                tenant_id=self._adls_kwargs.get("tenant_id"),
-                client_id=self._adls_kwargs.get("client_id"),
-                client_secret=self._adls_kwargs.get("client_secret"),
-                use_default_credential=self._adls_kwargs.get("use_default_credential", False),
             ),
         )
+
+    def _archive_storage_config(self):
+        """Return (S3Config | None, ADLSConfig | None) for the archive storage.
+        Falls back to _source_storage_config() when no archive-specific backend is set."""
+        if self._archive_adls_kwargs:
+            from iceberg_sync.archive.config import ADLSConfig
+            return (
+                None,
+                ADLSConfig(
+                    account_name=self._archive_adls_kwargs.get("account_name", ""),
+                    account_key=self._archive_adls_kwargs.get("account_key"),
+                ),
+            )
+        return self._source_storage_config()
 
     def _catalog_config(self):
         from iceberg_sync.archive.config import CatalogConfig
         return CatalogConfig(
             nessie_uri=self._nessie_uri or "",
             nessie_ref=self._nessie_ref,
+            catalog_rest_uri=self._gateway_url or "",
             oauth_url=self._oauth_url or "",
             oauth_client_id=self._oauth_client_id or "",
             oauth_client_secret=self._oauth_secret or "",
@@ -193,7 +206,8 @@ class IcebergConnection:
     ):
         """Return an ArchiveJobConfig ready for IcebergArchiver.from_config()."""
         from iceberg_sync.archive.config import ArchiveJobConfig, TransferConfig
-        s3, adls = self._storage_config()
+        source_s3, source_adls = self._source_storage_config()
+        archive_s3, archive_adls = self._archive_storage_config()
         kwargs = dict(
             source_root=self.warehouse_root,
             table=table,
@@ -204,10 +218,14 @@ class IcebergConnection:
             catalog=self._catalog_config(),
             transfer=TransferConfig(parallelism=parallelism),
         )
-        if s3:
-            kwargs.update(source_s3=s3, archive_s3=s3)
-        if adls:
-            kwargs.update(source_adls=adls, archive_adls=adls)
+        if source_s3:
+            kwargs["source_s3"] = source_s3
+        if source_adls:
+            kwargs["source_adls"] = source_adls
+        if archive_s3:
+            kwargs["archive_s3"] = archive_s3
+        if archive_adls:
+            kwargs["archive_adls"] = archive_adls
         return ArchiveJobConfig(**kwargs)
 
     def make_restore_config(
@@ -224,7 +242,8 @@ class IcebergConnection:
     ):
         """Return a RestoreJobConfig ready for IcebergRestorer.from_config()."""
         from iceberg_sync.archive.config import RestoreJobConfig, TransferConfig
-        s3, adls = self._storage_config()
+        archive_s3, archive_adls = self._archive_storage_config()
+        target_s3, target_adls = self._source_storage_config()
         kwargs = dict(
             archive_root=self.archive_root,
             table=table,
@@ -238,10 +257,14 @@ class IcebergConnection:
             catalog=self._catalog_config(),
             transfer=TransferConfig(parallelism=parallelism),
         )
-        if s3:
-            kwargs.update(archive_s3=s3, target_s3=s3)
-        if adls:
-            kwargs.update(archive_adls=adls, target_adls=adls)
+        if archive_s3:
+            kwargs["archive_s3"] = archive_s3
+        if archive_adls:
+            kwargs["archive_adls"] = archive_adls
+        if target_s3:
+            kwargs["target_s3"] = target_s3
+        if target_adls:
+            kwargs["target_adls"] = target_adls
         return RestoreJobConfig(**kwargs)
 
     def __repr__(self) -> str:
@@ -268,18 +291,19 @@ class IcebergConnectionBuilder:
     """
 
     def __init__(self) -> None:
-        self._backend:        Optional[str] = None
-        self._s3_kwargs:      Dict[str, Any] = {}
-        self._adls_kwargs:    Dict[str, Any] = {}
-        self._warehouse_root: Optional[str] = None
-        self._archive_root:   Optional[str] = None
-        self._gateway_url:    Optional[str] = None
-        self._nessie_uri:     Optional[str] = None
-        self._nessie_ref:     str = "main"
-        self._oauth_url:      Optional[str] = None
-        self._oauth_client_id:Optional[str] = None
-        self._oauth_secret:   Optional[str] = None
-        self._oauth_scope:    str = "catalog:read catalog:write"
+        self._backend:             Optional[str] = None
+        self._s3_kwargs:           Dict[str, Any] = {}
+        self._adls_kwargs:         Dict[str, Any] = {}
+        self._archive_adls_kwargs: Dict[str, Any] = {}
+        self._warehouse_root:      Optional[str] = None
+        self._archive_root:        Optional[str] = None
+        self._gateway_url:         Optional[str] = None
+        self._nessie_uri:          Optional[str] = None
+        self._nessie_ref:          str = "main"
+        self._oauth_url:           Optional[str] = None
+        self._oauth_client_id:     Optional[str] = None
+        self._oauth_secret:        Optional[str] = None
+        self._oauth_scope:         str = "catalog:read catalog:write"
 
     # ── Storage backend methods ───────────────────────────────────────────────
 
@@ -433,7 +457,7 @@ class IcebergConnectionBuilder:
         (IcebergArchiver / IcebergRestorer).
 
         Example:
-            .oauth("http://localhost:8081/oauth2/token",
+            .oauth("http://localhost:8081/token",
                    client_id="sync-service",
                    client_secret="sync-secret")
         """
@@ -453,7 +477,7 @@ class IcebergConnectionBuilder:
         Example:
             .warehouse("s3a://warehouse/iceberg")
         """
-        self._warehouse_root = root_uri.rstrip("/")
+        self._warehouse_root = root_uri.strip("\"'").rstrip("/")
         return self
 
     def archive(self, root_uri: str) -> "IcebergConnectionBuilder":
@@ -466,7 +490,36 @@ class IcebergConnectionBuilder:
         Example (ADLS):
             .archive("abfss://archive@account.dfs.core.windows.net/iceberg-cold")
         """
-        self._archive_root = root_uri.rstrip("/")
+        self._archive_root = root_uri.strip("\"'").rstrip("/")
+        return self
+
+    def archive_adls(
+        self,
+        *,
+        account_name: str,
+        account_key: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
+        use_default_credential: bool = False,
+    ) -> "IcebergConnectionBuilder":
+        """
+        Use a different ADLS account for cold storage (split-backend).
+        Call this when the source is S3/MinIO but the archive target is Azure.
+
+        Example:
+            .s3(endpoint="http://localhost:9000", ...)
+            .archive_adls(account_name="sticebergpipeline", account_key="<key>")
+            .archive("abfss://archive@sticebergpipeline.dfs.core.windows.net/iceberg-cold")
+        """
+        self._archive_adls_kwargs = {
+            "account_name":           account_name,
+            "account_key":            account_key,
+            "tenant_id":              tenant_id,
+            "client_id":              client_id,
+            "client_secret":          client_secret,
+            "use_default_credential": use_default_credential,
+        }
         return self
 
     # ── Terminal method ───────────────────────────────────────────────────────
@@ -498,6 +551,7 @@ class IcebergConnectionBuilder:
             archive_root=self._archive_root,
             _s3_kwargs=dict(self._s3_kwargs),
             _adls_kwargs=dict(self._adls_kwargs),
+            _archive_adls_kwargs=dict(self._archive_adls_kwargs),
             _gateway_url=self._gateway_url,
             _nessie_uri=self._nessie_uri,
             _nessie_ref=self._nessie_ref,
@@ -538,7 +592,7 @@ class IcebergConnectionBuilder:
                 ref=os.getenv("NESSIE_REF", "main"),
             )
             .oauth(
-                os.getenv("OAUTH_URL", "http://localhost:8081/oauth2/token"),
+                os.getenv("OAUTH_URL", "http://localhost:8081/token"),
                 client_id=    os.getenv("OAUTH_CLIENT_ID", "admin-client"),
                 client_secret=os.getenv("OAUTH_CLIENT_SECRET", "admin-secret"),
             )

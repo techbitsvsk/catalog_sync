@@ -32,6 +32,7 @@ def create_storage(
                        aws_access_key_id="minioadmin",
                        aws_secret_access_key="minioadmin")
     """
+    uri_or_scheme = uri_or_scheme.strip("\"'")
     scheme = uri_or_scheme.split("://")[0].lower()
 
     if scheme in ("s3", "s3a", "s3n"):

@@ -82,6 +82,7 @@ def decide_snapshots(
     *,
     now_ms: Optional[int] = None,
     already_archived_ids: Optional[Set[int]] = None,
+    effective_timestamps: Optional[Dict[int, int]] = None,
 ) -> List[SnapshotDecision]:
     """
     Evaluate every snapshot in *metadata* and return a decision for each.
@@ -96,6 +97,12 @@ def decide_snapshots(
         now_ms:                 Current time in epoch-ms (injectable for tests).
         already_archived_ids:   Snapshot IDs already present in the archive
                                 index — skip re-archiving them.
+        effective_timestamps:   Optional mapping of snapshot_id → epoch-ms to
+                                use as the logical age of that snapshot instead
+                                of its write timestamp. Intended for COB-date
+                                awareness: pass the partition lower-bound date
+                                so that retention is evaluated against the data's
+                                business date rather than when it was written.
 
     Returns:
         List of SnapshotDecision, one per snapshot, ordered newest-first.
@@ -105,6 +112,7 @@ def decide_snapshots(
 
     cutoff_ms = now_ms - parse_duration_ms(older_than)
     already_archived = already_archived_ids or set()
+    cob_dates = effective_timestamps or {}
 
     snapshots: List[dict] = metadata.get("snapshots", [])
     if not snapshots:
@@ -130,6 +138,8 @@ def decide_snapshots(
         snap_id: int = snap.get("snapshot-id", 0)
         ts_ms: int = snap.get("timestamp-ms", 0)
         operation: str = snap.get("summary", {}).get("operation", "unknown")
+        # Use COB date if provided; fall back to write timestamp.
+        effective_ts_ms: int = cob_dates.get(snap_id, ts_ms)
 
         # Rule 1: always keep current
         if snap_id == current_id:
@@ -149,8 +159,8 @@ def decide_snapshots(
             kept_count += 1
             continue
 
-        # Rule 4: within retention window → keep
-        if ts_ms >= cutoff_ms:
+        # Rule 4: within retention window → keep (uses COB date when provided)
+        if effective_ts_ms >= cutoff_ms:
             decisions.append(SnapshotDecision(snap_id, ts_ms, operation, True, "within_retention"))
             kept_count += 1
             continue

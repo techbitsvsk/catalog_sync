@@ -87,13 +87,13 @@ sequenceDiagram
         CLI-->>User: List of available snapshots
 
         User->>CLI:  iceberg-archive restore --partition year=2025/month=11 --as-of 2025-12-01
-        CLI->>COLD: Scan manifests → filter partition files
+        CLI->>COLD: Scan manifests → filter partition files (path_rewriter: source URI → archive URI)
         CLI-->>User: Print dry-run plan (no writes yet)
 
-        User->>CLI:  iceberg-archive restore ... --confirm
+        User->>CLI:  iceberg-archive restore ... --confirm (or restorer.execute(plan) in Python)
         CLI->>COLD: Copy matching data files → Primary
-        CLI->>PRI:  Reconstruct metadata.json
-        CLI->>CAT:  Register updated table
+        CLI->>PRI:  Reconstruct / splice metadata.json
+        CLI->>CAT:  Register updated table (Nessie or version-hint.text fallback)
         CLI-->>User: Restore complete ✓
     end
 ```
@@ -529,9 +529,16 @@ Options:
 - `--restore-as gold/orders_backup` + `--mode new_table` — restore side-by-side.
 
 **`No files found for snapshot … matching partitions`**
-The partition key/value you specified does not match the table's partition spec.
-Run `iceberg-archive snapshots` and check the `partition_spec` field in the
-`.archive-manifest.json` file to confirm the correct field names and value types.
+The partition key/value you specified does not match the table's partition spec,
+or the archive manifest paths could not be read from the archive backend.
+
+- Run `iceberg-archive snapshots` and check the `partition_spec` field in
+  `.archive-manifest.json` to confirm field names.
+- Always pass partition values as plain strings (e.g. `"2024-03"`).
+  The scanner normalises Avro binary values to strings automatically.
+- If you archive to a different storage backend than the source (e.g. source = S3,
+  archive = ADLS), ensure the `archive_root` in the restore config matches the URI
+  prefix used during archiving so internal manifest paths are translated correctly.
 
 **Archive index missing (`.archive-manifest.json` not found)**
 The archive storage location may be wrong, or the table was archived with an

@@ -59,9 +59,10 @@ classDiagram
         +from_config(cfg) IcebergRestorer
         -_archive StorageBackend
         -_target StorageBackend
-        -_load_archived_metadata(table) dict
+        -_load_archived_metadata(table, snapshot_id) dict
         -_load_target_metadata(table) dict
-        -_copy_manifests(...)
+        -_make_path_rewriter(source_root) Callable
+        -_copy_manifests(archived_metadata, snapshot_id, archive_root, target_table_root, path_rewriter)
         -_commit_metadata(table, root, uri)
     }
 
@@ -189,13 +190,16 @@ sequenceDiagram
     Note over R,ME: plan() — dry-run, no writes
 
     R->>AI: ArchiveIndex.load(archive, table)
-    AI-->>R: ArchiveIndex
+    AI-->>R: ArchiveIndex (source_root, snapshots)
     R->>AI: find_snapshot(as_of / snapshot_id)
     AI-->>R: ArchivedSnapshotEntry
-    R->>CS: read archived metadata.json
-    R->>PS: scan_snapshot(archive, metadata, snap_id, partitions)
-    PS->>CS: read manifest-list Avro
-    PS->>CS: read manifest Avro files
+    R->>R: _make_path_rewriter(index.source_root)
+    Note right of R: translates s3a://bucket/... URIs<br/>to archive abfss://... equivalents
+    R->>CS: _load_archived_metadata(table, snap_id)
+    Note right of R: scans all *.metadata.json files,<br/>merges snapshots, falls back to<br/>snap-{id}-*.avro scan if needed
+    R->>PS: scan_snapshot(archive, metadata, snap_id, partitions, path_rewriter)
+    PS->>CS: read manifest-list Avro (archive URI)
+    PS->>CS: read manifest Avro files (archive URI via path_rewriter)
     PS-->>R: List[ScannedFile] (filtered by partition)
     R->>RP: build_plan(files, conflicts, mode)
     RP->>TS: exists() checks for conflict detection
@@ -204,17 +208,21 @@ sequenceDiagram
 
     Note over R,ME: execute(plan) — after user reviews plan
 
+    R->>AI: ArchiveIndex.load (rebuild path_rewriter for execute)
+    R->>R: _make_path_rewriter(index.source_root)
+
     loop Parallel copy
         R->>TS: copy_from(archive, data_file, target_uri)
     end
 
-    R->>TS: copy manifest + manifest-list Avro files
+    R->>TS: copy manifest Avro files (path_rewriter → archive → target)
 
     alt mode = new_table OR full replace
         R->>ME: write_table_metadata(archived_meta, target_root)
     else mode = partial partition replace/append
         R->>TS: read live metadata.json
         R->>ME: splice_manifests(live_meta, restored_manifests, mode)
+        Note right of ME: new manifest-list entry includes<br/>all Iceberg v2 fields (content,<br/>sequence_number, min_sequence_number)
     end
 
     ME-->>R: new_meta_uri
@@ -227,10 +235,13 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    A([scan_snapshot]) --> B[Find snapshot in metadata.json]
+    A([scan_snapshot\nstorage · metadata · snap_id\npartitions · path_rewriter]) --> B[Find snapshot in metadata.json]
     B --> C[Read manifest-list Avro\nfrom archive storage]
     C --> D[For each manifest path\nin manifest-list]
-    D --> E[Read manifest Avro file]
+    D --> RW{path_rewriter\nprovided?}
+    RW -- Yes --> RW2[Rewrite manifest_path\nsource URI → archive URI]
+    RW -- No --> E
+    RW2 --> E[Read manifest Avro file\nfrom archive storage]
     E --> F[For each record in manifest]
     F --> G{status == DELETED?}
     G -- Yes --> SKIP[Skip]
@@ -238,7 +249,8 @@ flowchart TD
     H -- Yes --> SKIP
     H -- No --> I{Partition matches\nany requested?}
     I -- "No\n(or no partitions requested)" --> SKIP
-    I -- Yes / Full table --> J[Emit ScannedFile\nfile_path · partition\nfile_size · content]
+    I -- Yes / Full table --> N[Normalize partition values\nbytes → str]
+    N --> J[Emit ScannedFile\nfile_path · partition\nfile_size · content]
     J --> K{More records?}
     K -- Yes --> F
     K -- No --> L{More manifests?}
@@ -248,6 +260,8 @@ flowchart TD
     style A fill:#dbeafe
     style Z fill:#dcfce7
     style SKIP fill:#f3f4f6
+    style RW2 fill:#fef3c7
+    style N fill:#fef3c7
 ```
 
 ### Partial key matching
@@ -256,12 +270,23 @@ A requested partition `{"year": 2025}` matches any file whose partition record
 contains `year=2025`, regardless of other fields (e.g. `month`, `day`).
 
 ```python
+def _normalize_partition_value(v):
+    """Decode bytes partition values to str (Iceberg stores strings as binary in Avro)."""
+    if isinstance(v, (bytes, bytearray)):
+        return v.decode("utf-8")
+    return v
+
 def _partition_matches(file_partition, requested):
     for key, value in requested.items():
-        if file_partition.get(key) != value:
+        actual = _normalize_partition_value(file_partition.get(key))
+        if actual != value:
             return False
     return True
 ```
+
+> **Note:** Iceberg encodes string partition values as raw bytes in Avro.
+> `_normalize_partition_value` decodes them to `str` before comparison so callers
+> can always pass plain Python strings (e.g. `{"order_month": "2024-03"}`).
 
 This means you can restore an entire year's worth of data across all months
 by specifying `--partition year=2025` rather than listing every month.
@@ -313,6 +338,10 @@ Key points:
 - Restored manifests are added to the new manifest-list alongside current ones.
 - A new snapshot (`snap-503`) with `operation=overwrite` is appended.
 - The old snapshot (`snap-502`) remains in history for time-travel.
+- Internal Avro manifest paths are rewritten from source storage URIs to archive URIs
+  via `_make_path_rewriter` before reading — the archive files themselves are not modified.
+- The new manifest-list entry includes all Iceberg v2 required fields: `content`,
+  `sequence_number`, `min_sequence_number`, and row-count statistics.
 
 ---
 

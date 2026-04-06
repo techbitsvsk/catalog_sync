@@ -54,6 +54,7 @@ import argparse
 import os
 import sys
 import time
+from datetime import date, timedelta
 from pathlib import Path
 
 # ── Ensure e2e/scripts is importable regardless of working directory ──────────
@@ -64,7 +65,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich import box
 
-console = Console()
+console = Console(legacy_windows=False)
 
 DATA_DIR       = Path("e2e/data/orders")
 NAMESPACE      = "tpch"
@@ -72,7 +73,7 @@ TABLE_NAME     = "orders"
 FULL_TABLE     = f"{NAMESPACE}.{TABLE_NAME}"
 ARCHIVE_TABLE  = f"{NAMESPACE}/{TABLE_NAME}"
 RESTORE_MONTH  = "2024-03"
-RESTORE_AS_OF  = "2024-04-01"
+RESTORE_AS_OF  = (date.today() + timedelta(days=1)).isoformat()
 
 ALL_STAGES = ["generate", "create", "archive", "restore", "verify", "access"]
 
@@ -86,7 +87,8 @@ def make_connection(backend: str):
     from connection import IcebergConnectionBuilder
 
     if backend == "s3":
-        return (
+        archive_root = os.getenv("ARCHIVE_ROOT", "s3a://warehouse/archive")
+        builder = (
             IcebergConnectionBuilder()
             .s3(
                 endpoint=   os.getenv("MINIO_ENDPOINT",   "http://localhost:9000"),
@@ -100,14 +102,26 @@ def make_connection(backend: str):
                 ref=os.getenv("NESSIE_REF", "main"),
             )
             .oauth(
-                os.getenv("OAUTH_URL", "http://localhost:8081/oauth2/token"),
+                os.getenv("OAUTH_URL", "http://localhost:8081/token"),
                 client_id=     os.getenv("OAUTH_CLIENT_ID",     "admin-client"),
                 client_secret= os.getenv("OAUTH_CLIENT_SECRET", "admin-secret"),
             )
             .warehouse(os.getenv("WAREHOUSE_ROOT", "s3a://warehouse/iceberg"))
-            .archive(  os.getenv("ARCHIVE_ROOT",   "s3a://warehouse/archive"))
-            .build()
+            .archive(archive_root)
         )
+        # Split-backend: S3 source → ADLS archive when Azure env vars are present
+        azure_account = os.getenv("AZURE_STORAGE_ACCOUNT")
+        azure_key     = os.getenv("AZURE_STORAGE_KEY")
+        if azure_account and archive_root.strip("\"'").startswith("abfss://"):
+            builder.archive_adls(
+                account_name=           azure_account,
+                account_key=            azure_key,
+                tenant_id=              os.getenv("AZURE_TENANT_ID"),
+                client_id=              os.getenv("AZURE_CLIENT_ID"),
+                client_secret=          os.getenv("AZURE_CLIENT_SECRET"),
+                use_default_credential= not azure_key and not os.getenv("AZURE_CLIENT_SECRET"),
+            )
+        return builder.build()
 
     # ADLS / Fabric
     account = os.environ.get("AZURE_STORAGE_ACCOUNT", "")
@@ -246,6 +260,7 @@ def stage_generate(rows: int) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def stage_create(conn) -> dict:
+    import pyarrow as pa
     import pyarrow.parquet as pq
     from pyiceberg.partitioning import PartitionField, PartitionSpec
     from pyiceberg.schema import Schema
@@ -284,6 +299,7 @@ def stage_create(conn) -> dict:
     if catalog.table_exists(FULL_TABLE):
         _info(f"Table '{FULL_TABLE}' already exists — loading")
         table = catalog.load_table(FULL_TABLE)
+        _info(f"Table location: {table.location()}")
     else:
         table = catalog.create_table(
             FULL_TABLE,
@@ -309,7 +325,25 @@ def stage_create(conn) -> dict:
         files = list(part_dir.glob("*.parquet"))
         if not files:
             continue
-        arrow_tbl = pq.read_table(files[0])
+        # Use ParquetFile.read() instead of read_table() to avoid PyArrow's
+        # dataset API inferring a Hive partition column (order_month=…/ dir)
+        # as dictionary type, which conflicts with the string column in the file.
+        arrow_tbl = pq.ParquetFile(files[0]).read()
+        # Cast any remaining dictionary-encoded columns to their plain value type.
+        decoded = {
+            name: (col.cast(col.type.value_type) if pa.types.is_dictionary(col.type) else col)
+            for name, col in zip(arrow_tbl.schema.names, arrow_tbl.columns)
+        }
+        arrow_tbl = pa.table(decoded)
+        # Coerce nullability to match Iceberg required fields: mark order_key
+        # non-nullable in the Arrow schema (DuckDB always emits nullable columns).
+        iceberg_schema = table.schema()
+        new_fields = []
+        for f in arrow_tbl.schema:
+            iceberg_field = iceberg_schema.find_field(f.name)
+            nullable = not iceberg_field.required if iceberg_field else True
+            new_fields.append(f.with_nullable(nullable))
+        arrow_tbl = arrow_tbl.cast(pa.schema(new_fields))
         table.append(arrow_tbl)
         total_rows += len(arrow_tbl)
         _ok(f"order_month={month}  {len(arrow_tbl):>10,} rows loaded")
@@ -343,6 +377,11 @@ def stage_archive(conn) -> dict:
     dry = archiver.archive_table(ARCHIVE_TABLE, dry_run=True)
     _info(f"Plan: {dry.snapshots_archived} snapshot(s) to archive, "
           f"{dry.files_copied} file(s), {dry.bytes_copied:,} bytes")
+
+    if dry.errors:
+        for e in dry.errors:
+            _fail(e)
+        sys.exit(1)
 
     if dry.snapshots_archived == 0:
         _warn("No snapshots eligible for archival with current retention policy.")

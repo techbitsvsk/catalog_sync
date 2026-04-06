@@ -102,6 +102,7 @@ class ADLSConfig:
 class CatalogConfig:
     nessie_uri: Optional[str] = None
     nessie_ref: str = "main"
+    catalog_rest_uri: Optional[str] = None   # Iceberg REST catalog URL (e.g. catalog-gateway)
     oauth_url: Optional[str] = None
     oauth_client_id: Optional[str] = None
     oauth_client_secret: Optional[str] = None
@@ -111,6 +112,7 @@ class CatalogConfig:
         return cls(
             nessie_uri=d.get("nessie_uri"),
             nessie_ref=d.get("nessie_ref", "main"),
+            catalog_rest_uri=d.get("catalog_rest_uri"),
             oauth_url=d.get("oauth_url"),
             oauth_client_id=d.get("oauth_client_id"),
             oauth_client_secret=d.get("oauth_client_secret"),

@@ -238,6 +238,12 @@ def splice_manifests(
         ml_records = filtered_ml_records
 
     # Add restored manifest entries to the manifest-list
+    # Use an existing record as a template so all schema-required fields
+    # (including Iceberg v2's sequence_number, min_sequence_number, content,
+    # added_rows_count, etc.) are present with valid defaults.
+    _ml_template: dict = ml_records[0] if ml_records else {}
+    _next_seq: int = current_metadata.get("last-sequence-number", 0) + 1
+
     for restored_uri in restored_manifest_uris:
         try:
             manifest_bytes = target_storage.read_bytes(restored_uri)
@@ -245,16 +251,30 @@ def splice_manifests(
             added = sum(1 for r in records_in_manifest if r.get("status") == 1)
             existing = sum(1 for r in records_in_manifest if r.get("status") == 0)
 
-            ml_records.append({
+            new_entry = dict(_ml_template)
+            new_entry.update({
                 "manifest_path": restored_uri,
                 "manifest_length": len(manifest_bytes),
                 "partition_spec_id": current_metadata.get("default-spec-id", 0),
+                "content": 0,
+                "sequence_number": _next_seq,
+                "min_sequence_number": _next_seq,
                 "added_snapshot_id": new_snap_id,
                 "added_data_files_count": added,
                 "existing_data_files_count": existing,
                 "deleted_data_files_count": 0,
+                "added_rows_count": sum(
+                    (r.get("data_file") or r).get("record_count", 0)
+                    for r in records_in_manifest if r.get("status") == 1
+                ),
+                "existing_rows_count": sum(
+                    (r.get("data_file") or r).get("record_count", 0)
+                    for r in records_in_manifest if r.get("status") == 0
+                ),
+                "deleted_rows_count": 0,
                 "partitions": [],
             })
+            ml_records.append(new_entry)
         except Exception as exc:
             log.warning("Could not read restored manifest %s: %s", restored_uri, exc)
 

@@ -45,6 +45,13 @@ class ScannedFile:
     record_count: int = 0
 
 
+def _normalize_partition_value(v: Any) -> Any:
+    """Decode bytes partition values to str (Iceberg stores strings as binary in Avro)."""
+    if isinstance(v, (bytes, bytearray)):
+        return v.decode("utf-8")
+    return v
+
+
 def _partition_matches(file_partition: Dict[str, Any], requested: Dict[str, Any]) -> bool:
     """
     Return True if *file_partition* satisfies *requested*.
@@ -53,7 +60,8 @@ def _partition_matches(file_partition: Dict[str, Any], requested: Dict[str, Any]
     partition spec matches any file whose specified keys are equal.
     """
     for key, value in requested.items():
-        if file_partition.get(key) != value:
+        actual = _normalize_partition_value(file_partition.get(key))
+        if actual != value:
             return False
     return True
 
@@ -97,6 +105,7 @@ def scan_snapshot(
     requested_partitions: List[Dict[str, Any]],
     *,
     include_delete_files: bool = True,
+    path_rewriter: Optional[Any] = None,
 ) -> List[ScannedFile]:
     """
     Walk the manifest chain for *snapshot_id* and return only the files
@@ -139,6 +148,8 @@ def scan_snapshot(
         manifest_path: str = manifest_entry.get("manifest_path", "")
         if not manifest_path:
             continue
+        if path_rewriter is not None:
+            manifest_path = path_rewriter(manifest_path)
 
         try:
             for record in _read_manifest(storage, manifest_path):

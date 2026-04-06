@@ -150,12 +150,12 @@ iceberg-archive restore ... --confirm
 ### Security layers (⑩–⑬)
 
 ```
-⑥ Authenticate   OAuth 2.0 client credentials; RS256 JWT; OIDC discovery
-⑦ Authorize      OPA allow/deny via Rego policy → HTTP 403 from gateway                (hard — Layer 1)
-⑧ RLS            Virtual manifest-list: gateway writes filtered copy to MinIO,          (hard — Layer 2)
+⑩ Authenticate   OAuth 2.0 client credentials; RS256 JWT; OIDC discovery
+⑪ Authorize      OPA allow/deny via Rego policy → HTTP 403 from gateway                (hard — Layer 1)
+⑫ RLS            Virtual manifest-list: gateway writes filtered copy to MinIO,          (hard — Layer 2)
                    rewrites snapshot URL in GET table response → Spark downloads
                    only allowed partition files (transparent, no Spark cooperation)
-⑨ CLS            Column exclusion: schema rewrite removes fields from metadata           (hard — Layer 4)
+⑬ CLS            Column exclusion: schema rewrite removes fields from metadata           (hard — Layer 4)
                  Column masking:   stored as table property; query engine applies       (advisory — Layer 3)
 ```
 
@@ -364,10 +364,12 @@ catalog-sync/
 │       └── init-dbs.sh            # Creates nessie, oauth, airflow databases
 │
 └── docs/
-    ├── catalog-sync.md
-    ├── nessie-setup.md
-    ├── oauth-setup.md
-    ├── opa-policies.md            # OPA policy guide (replaces data-contracts.md)
-    ├── airflow.md
-    └── production.md
+    ├── catalog-sync.md            # Sync engine — CLI, Python API, platform support
+    ├── archive.md                 # Archive & partition restore — config, workflow, examples
+    ├── archive-dev.md             # Archive module — design, class diagrams, data flows
+    ├── nessie-setup.md            # Nessie — PostgreSQL config, JWT auth, API usage
+    ├── oauth-setup.md             # OAuth service — token flow, client management, OIDC
+    ├── opa-policies.md            # OPA policy guide — Rego structure, enforcement layers
+    ├── airflow.md                 # DAG setup, operators, XCom contract
+    └── production.md              # IdP migration, secrets, HA
 ```
