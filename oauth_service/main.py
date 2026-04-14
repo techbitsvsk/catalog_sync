@@ -91,6 +91,8 @@ def _seed_clients(db: Session):
          "catalog:read catalog:write"),
         ("data-scientist", "ds-secret", "Data Scientist",
          "catalog:read"),
+        ("ops-client", "ops-secret", "Platform Ops Engineer",
+         "catalog:read catalog:write catalog:admin"),
     ]
     for client_id, secret, name, scopes in defaults:
         existing = db.query(OAuthClient).filter_by(client_id=client_id).first()

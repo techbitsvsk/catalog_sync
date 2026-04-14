@@ -43,6 +43,14 @@ default allow := false
 # Trusted internal principals — unrestricted
 allow if input.principal in {"admin-client", "sync-service", "catalog-gateway"}
 
+# ops-client — platform ops engineers: full catalog access across all namespaces
+# Attack surface: ops engineers can write any table metadata, including descriptions
+# and column docs, which feed into downstream RAG pipelines.
+allow if {
+    input.principal == "ops-client"
+    input.operation in {"READ", "LIST", "WRITE", "DROP"}
+}
+
 # analytics-client — gold namespace, read-only
 allow if {
     input.principal == "analytics-client"
