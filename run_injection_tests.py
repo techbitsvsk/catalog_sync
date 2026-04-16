@@ -79,9 +79,9 @@ def _check_ollama(use_ollama: bool) -> bool:
 
 
 @click.command()
-@click.option("--use-ollama", is_flag=True, default=False,
+@click.option("--use-ollama", is_flag=True, default=True,
               help="Use Ollama for the RAG agent LLM (requires ollama running).")
-@click.option("--ollama-classifier", is_flag=True, default=False,
+@click.option("--ollama-classifier", is_flag=True, default=True,
               help="Also use Ollama for AI-enhanced classification (ambiguous cases only).")
 @click.option("--risk", multiple=True,
               type=click.Choice(["critical", "high", "medium", "low", "none"]),

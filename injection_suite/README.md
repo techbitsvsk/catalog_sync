@@ -9,6 +9,7 @@ A security testing framework that demonstrates and defends against **prompt inje
 - [What This Suite Tests](#what-this-suite-tests)
 - [The Attack Surface](#the-attack-surface)
 - [Architecture Overview](#architecture-overview)
+- [Technical Setup — No Vector Database](#technical-setup--no-vector-database)
 - [How the Attack Works](#how-the-attack-works)
 - [Payload Library — 23 Scenarios](#payload-library--23-scenarios)
 - [Detection: The Two-Tier Classifier](#detection-the-two-tier-classifier)
@@ -108,6 +109,111 @@ All three vectors are read by the analytics client and formatted into the LLM's 
 |---|---|---|
 | **Vulnerable** | Passes metadata directly to LLM with no filtering | Demonstrates the attack succeeds |
 | **Guarded** | Runs classifier on each field first; blocks/sanitizes before LLM | Demonstrates the defense works |
+
+---
+
+## Technical Setup — No Vector Database
+
+### Short answer
+
+**This suite does not use a vector database or embeddings.** Data is read directly from the Apache Iceberg catalog as structured metadata, not as embedded document chunks.
+
+### What "RAG" means here
+
+The term RAG is used in its general sense: *retrieve context, then generate*. In a typical document RAG system the retrieval step is a vector similarity search over embedded text chunks. Here the retrieval step is a **deterministic structured catalog lookup**:
+
+```
+Traditional document RAG:
+  user query → embed → similarity search (vector DB) → top-k chunks → LLM
+
+This suite (metadata RAG):
+  user query → catalog.load_table() → read properties + schema docs → LLM
+```
+
+There is no embedding model, no vector store, no similarity threshold, and no chunking. The retrieved context is always the complete, structured metadata of one specific Iceberg table.
+
+### Data flow in detail
+
+```
+MinIO (S3-compatible object store)
+  └── s3a://warehouse/iceberg/gold/orders_inj/
+        ├── metadata/
+        │     ├── v1.metadata.json   ← table description stored here
+        │     └── v2.metadata.json   ← updated after each poison call
+        └── data/
+              └── (parquet files — not read during tests)
+
+PyIceberg REST catalog client
+  └── connects to catalog-gateway :8083
+        ├── authenticates via OAuth2 at :8081/token
+        └── Nessie REST API v2 is the catalog backend
+```
+
+When `read_metadata()` is called the PyIceberg client:
+
+1. `catalog.load_table("gold.orders_inj")` — fetches the current metadata JSON pointer from Nessie
+2. `table.refresh()` — resolves the latest metadata file from MinIO
+3. `table.metadata.properties` — returns the key/value property map (contains `description`, `etl.notes`, etc.)
+4. `table.schema().fields` — iterates schema fields and reads `field.doc` for each column
+
+No row data is read. No parquet files are opened. The attack surface is entirely in **metadata JSON**, not in actual table contents.
+
+### How the metadata becomes an LLM prompt
+
+`TableMetadata.to_prompt_context()` formats the three field types into a plain-text block:
+
+```
+Table: gold.orders_inj
+Description: <table properties["description"]>
+
+Column documentation:
+  order_key:    <NestedField.doc>
+  comment:      <NestedField.doc>   ← primary column_doc injection target
+
+Additional properties:
+  etl.notes:    <table properties["etl.notes"]>
+```
+
+This block is concatenated into the LLM's user message verbatim — no sanitization in the vulnerable pipeline, classifier screening in the guarded pipeline.
+
+### PyIceberg client configuration
+
+Two OAuth2 clients are created, both pointing at the same catalog-gateway:
+
+```python
+# ops-client — WRITE access (simulates rogue data engineer / ETL pipeline)
+load_catalog("rest",
+    uri              = "http://localhost:8083",
+    oauth2-server-uri = "http://localhost:8081/token",
+    credential       = "ops-client:ops-secret",
+    scope            = "catalog:read catalog:write",
+    s3.endpoint      = "http://localhost:9000",
+)
+
+# analytics-client — READ-only access (simulates downstream RAG pipeline)
+load_catalog("rest",
+    uri              = "http://localhost:8083",
+    oauth2-server-uri = "http://localhost:8081/token",
+    credential       = "analytics-client:analytics-secret",
+    scope            = "catalog:read catalog:write",
+    s3.endpoint      = "http://localhost:9000",
+)
+```
+
+OPA (Open Policy Agent) enforces the boundary: `ops-client` can write to any namespace; `analytics-client` can only read from the `gold` namespace. Both access the same physical metadata files in MinIO through Nessie.
+
+### Stack summary
+
+| Component | Role | Local address |
+|---|---|---|
+| **Nessie** | Iceberg REST catalog backend (API v2) | `:19120` |
+| **MinIO** | S3-compatible object store (metadata + parquet) | `:9000` |
+| **catalog-gateway** | OPA-enforced REST proxy in front of Nessie | `:8083` |
+| **OAuth2 server** | Issues tokens for ops-client / analytics-client | `:8081` |
+| **PyIceberg** | Python client — reads/writes metadata JSON | (library) |
+| **Ollama** | Optional local LLM for real generation testing | `:11434` |
+
+> **Key point:** Every injection attack in this suite exploits the fact that Iceberg metadata is just text stored in JSON files on object storage. There is no access control on the *content* of those fields — OPA only controls *who can write*. Once a payload is written, any reader (including the RAG pipeline) will see it exactly as stored.
 
 ---
 

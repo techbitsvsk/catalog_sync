@@ -54,7 +54,7 @@ class ClassifierResult:
     recommendation: str          # BLOCK | SANITIZE | FLAG | ALLOW
     evidence:      str            # human-readable explanation
     matches:       List[RuleMatch] = field(default_factory=list)
-    tier:          str = "rule"   # "rule" | "ollama" | "combined"
+    tier:          str = "ollama"   # "rule" | "ollama" | "combined"
 
     @property
     def should_block(self) -> bool:

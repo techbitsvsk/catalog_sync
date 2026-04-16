@@ -41,6 +41,9 @@ credentials.json
 # E2E generated data
 e2e/data/
 
+# Injection test reports (generated output — not source)
+reports/
+
 # Temp / scratch files
 *.tmp
 *.temp
